@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 from sqlmodel import Session, select
 
 from .models import Message
@@ -78,13 +78,62 @@ def _avg_turn_duration(items: List[Message]) -> float:
     return sum(durations) / len(durations)
 
 
+def _turn_durations(items: List[Message]) -> List[float]:
+    if not items:
+        return []
+    spans: Dict[int, Tuple[float, float]] = {}
+    for m in items:
+        ts = m.created_at.timestamp()
+        if m.turn_index not in spans:
+            spans[m.turn_index] = (ts, ts)
+        else:
+            start, end = spans[m.turn_index]
+            spans[m.turn_index] = (min(start, ts), max(end, ts))
+    return [round(end - start, 2) for _, (start, end) in sorted(spans.items())]
+
+
+def _response_times(items: List[Message]) -> Tuple[List[float], List[float], List[Dict[str, Any]]]:
+    if not items:
+        return [], []
+    by_turn: Dict[int, List[Message]] = {}
+    for m in items:
+        by_turn.setdefault(m.turn_index, []).append(m)
+    npc_times: List[float] = []
+    user_times: List[float] = []
+    per_turn: List[Dict[str, Any]] = []
+    for _, msgs in sorted(by_turn.items()):
+        msgs = sorted(msgs, key=lambda m: m.created_at)
+        if len(msgs) < 2:
+            continue
+        first, second = msgs[0], msgs[1]
+        delta = (second.created_at - first.created_at).total_seconds()
+        if first.role == "user" and second.role == "npc":
+            npc_times.append(delta)
+            per_turn.append(
+                {"turn_index": first.turn_index, "direction": "user_to_npc", "response_sec": round(delta, 2)}
+            )
+        elif first.role == "npc" and second.role == "user":
+            user_times.append(delta)
+            per_turn.append(
+                {"turn_index": first.turn_index, "direction": "npc_to_user", "response_sec": round(delta, 2)}
+            )
+    return npc_times, user_times, per_turn
+
+
 def _trend_summary(desires: List[int], window: int = 6) -> Dict[str, object]:
-    if len(desires) < 2:
+    if len(desires) == 0:
         return {
             "direction": "flat",
             "delta": 0.0,
-            "summary": "数据不足，暂无趋势判断",
-            "window": min(window, len(desires)),
+            "summary": "暂无趋势数据",
+            "window": 0,
+        }
+    if len(desires) == 1:
+        return {
+            "direction": "flat",
+            "delta": 0.0,
+            "summary": "仅1轮数据，趋势暂不判断（+0.0）",
+            "window": 1,
         }
     recent = desires[-window:] if window > 1 else desires[-1:]
     delta = float(recent[-1] - recent[0]) if len(recent) >= 2 else 0.0
@@ -118,11 +167,19 @@ def compute_stats(session: Session, chat_id: str) -> Dict[str, any]:
     avg_desire = sum(desires) / len(desires) if desires else 0.0
     emotion_distribution = {label: 0 for label in EMOTION_LABELS}
     for m in items:
+        if not m.emotion_label:
+            continue
         if m.emotion_label in emotion_distribution:
             emotion_distribution[m.emotion_label] += 1
+        else:
+            emotion_distribution["other"] += 1
     texts = [m.content for m in items]
     topics = [m.topic_tag or "" for m in items]
     avg_turn_duration = _avg_turn_duration(items)
+    per_turn_durations = _turn_durations(items)
+    npc_times, user_times, per_turn_responses = _response_times(items)
+    avg_npc_response = sum(npc_times) / len(npc_times) if npc_times else 0.0
+    avg_user_response = sum(user_times) / len(user_times) if user_times else 0.0
     trend = _trend_summary(desires, window=6)
     return {
         "total_messages": total_messages,
@@ -132,7 +189,11 @@ def compute_stats(session: Session, chat_id: str) -> Dict[str, any]:
         "lexical_diversity": lexical_diversity(texts),
         "topic_diversity": topic_diversity(topics),
         "desire_series": desires,
+        "per_turn_durations": per_turn_durations,
         "avg_turn_duration_sec": round(avg_turn_duration, 2),
+        "avg_npc_response_sec": round(avg_npc_response, 2),
+        "avg_user_response_sec": round(avg_user_response, 2),
+        "per_turn_responses": per_turn_responses,
         "trend_summary": trend["summary"],
         "trend_direction": trend["direction"],
         "trend_delta": trend["delta"],

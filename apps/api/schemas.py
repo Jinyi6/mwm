@@ -41,7 +41,7 @@ class MessageCreate(BaseModel):
 
 class AutoChatRequest(BaseModel):
     max_steps: int = 10
-    desire_stop: int = 5
+    desire_stop: int = 4
 
 
 class ActorUpdate(BaseModel):
@@ -56,7 +56,11 @@ class StatsResponse(BaseModel):
     lexical_diversity: Dict[str, float]
     topic_diversity: Dict[str, float]
     desire_series: List[int]
+    per_turn_durations: List[float]
     avg_turn_duration_sec: float
+    avg_npc_response_sec: float
+    avg_user_response_sec: float
+    per_turn_responses: List[Dict[str, object]]
     trend_summary: str
     trend_direction: str
     trend_delta: float
@@ -83,3 +87,12 @@ class SessionConfigUpdate(BaseModel):
 class SessionConfigResponse(BaseModel):
     chat_id: str
     session_time: str
+
+
+class NpcGenerateRequest(BaseModel):
+    world: Dict[str, Any]
+    style: str = "modern"
+
+
+class NpcGenerateResponse(BaseModel):
+    profile: Dict[str, Any]

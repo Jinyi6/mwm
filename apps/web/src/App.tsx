@@ -1,7 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react'
+import type { ComponentType } from 'react'
 import { Button, Input, Modal, Select, Slider, Tabs, Tag, Tooltip } from 'antd'
 import type { TabsProps } from 'antd'
-import { Bar, Line } from '@ant-design/plots'
+const LazyLine: ComponentType<any> = lazy(async () => {
+  const mod = await import('@ant-design/plots')
+  return { default: mod.Line }
+})
+const LazyBar: ComponentType<any> = lazy(async () => {
+  const mod = await import('@ant-design/plots')
+  return { default: mod.Bar }
+})
 
 type World = { id: string; name: string; snapshot: any; version: number }
 
@@ -26,7 +34,11 @@ type Stats = {
   lexical_diversity: { ttr: number; mtld: number }
   topic_diversity: { unique: number; entropy: number }
   desire_series: number[]
+  per_turn_durations: number[]
   avg_turn_duration_sec: number
+  avg_npc_response_sec: number
+  avg_user_response_sec: number
+  per_turn_responses: { turn_index: number; direction: string; response_sec: number }[]
   trend_summary: string
   trend_direction: string
   trend_delta: number
@@ -275,19 +287,47 @@ function ChartLine({ values }: { values: number[] }) {
   }
   const data = values.map((v, i) => ({ round: i + 1, value: v }))
   return (
-    <Line
-      data={data}
-      xField="round"
-      yField="value"
-      autoFit
-      height={160}
-      smooth
-      color="var(--primary)"
-      xAxis={{ label: { style: { fill: 'var(--muted)' } } }}
-      yAxis={{ min: 0, max: 10, tickCount: 6 }}
-      tooltip={{ showMarkers: true }}
-      animation={{ appear: { animation: 'path-in', duration: 800 } }}
-    />
+    <Suspense fallback={<div className="chart-empty">图表加载中...</div>}>
+      <LazyLine
+        data={data}
+        xField="round"
+        yField="value"
+        autoFit
+        height={160}
+        smooth
+        color="var(--primary)"
+        xAxis={{ label: { style: { fill: 'var(--muted)' } } }}
+        yAxis={{ min: 0, max: 10, tickCount: 6 }}
+        tooltip={{ showMarkers: true, shared: true }}
+        interactions={[{ type: 'element-active' }, { type: 'brush-x' }]}
+        animation={{ appear: { animation: 'path-in', duration: 800 } }}
+      />
+    </Suspense>
+  )
+}
+
+function ChartLineAny({ values, max }: { values: number[]; max?: number }) {
+  if (!values || values.length === 0) {
+    return <div className="chart-empty">暂无节奏数据</div>
+  }
+  const data = values.map((v, i) => ({ round: i + 1, value: v }))
+  return (
+    <Suspense fallback={<div className="chart-empty">图表加载中...</div>}>
+      <LazyLine
+        data={data}
+        xField="round"
+        yField="value"
+        autoFit
+        height={160}
+        smooth
+        color="var(--accent)"
+        xAxis={{ label: { style: { fill: 'var(--muted)' } } }}
+        yAxis={{ min: 0, max }}
+        tooltip={{ showMarkers: true, shared: true }}
+        interactions={[{ type: 'element-active' }, { type: 'brush-x' }]}
+        animation={{ appear: { animation: 'path-in', duration: 800 } }}
+      />
+    </Suspense>
   )
 }
 
@@ -298,17 +338,20 @@ function ChartBars({ data }: { data: Record<string, number> }) {
   }
   const chartData = entries.map(([key, val]) => ({ label: key, value: val }))
   return (
-    <Bar
-      data={chartData}
-      xField="value"
-      yField="label"
-      autoFit
-      height={200}
-      color="var(--primary)"
-      xAxis={{ tickCount: 5 }}
-      yAxis={{ label: { style: { fill: 'var(--muted)' } } }}
-      animation={{ appear: { animation: 'scale-in-x', duration: 600 } }}
-    />
+    <Suspense fallback={<div className="chart-empty">图表加载中...</div>}>
+      <LazyBar
+        data={chartData}
+        xField="value"
+        yField="label"
+        autoFit
+        height={200}
+        color="var(--primary)"
+        xAxis={{ tickCount: 5 }}
+        yAxis={{ label: { style: { fill: 'var(--muted)' } } }}
+        interactions={[{ type: 'element-active' }]}
+        animation={{ appear: { animation: 'scale-in-x', duration: 600 } }}
+      />
+    </Suspense>
   )
 }
 
@@ -324,8 +367,14 @@ function TrendBadge({ direction, delta, window }: { direction: string; delta: nu
   )
 }
 
+type StreamHandlers = {
+  onDelta?: (delta: string) => void
+  onNpcDone?: (msg: Message) => void
+  onUserDone?: (msg: Message) => void
+}
+
 export default function App() {
-  const [theme, setTheme] = useState<'town' | 'dream' | 'gothic' | 'pixel'>('town')
+  const [theme, setTheme] = useState<'town' | 'dream' | 'gothic' | 'pixel' | 'nebula'>('town')
   const [world, setWorld] = useState<World | null>(null)
   const [worldForm, setWorldForm] = useState<WorldForm>({
     sceneSetting: '',
@@ -368,12 +417,16 @@ export default function App() {
   const [inputDesire, setInputDesire] = useState(6)
   const [stats, setStats] = useState<Stats | null>(null)
   const [memoryConfig, setMemoryConfig] = useState<MemoryConfig | null>(null)
+  const [userMemoryConfig, setUserMemoryConfig] = useState<MemoryConfig | null>(null)
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null)
+  const [npcMemory, setNpcMemory] = useState<{ mode: string; items: any[] } | null>(null)
+  const [userMemory, setUserMemory] = useState<{ mode: string; items: any[] } | null>(null)
   const [downloadId, setDownloadId] = useState('')
   const [error, setError] = useState('')
   const [status, setStatus] = useState('')
   const [busy, setBusy] = useState(false)
-  const [modal, setModal] = useState<null | 'world' | 'chat'>(null)
+  const [npcStreamingId, setNpcStreamingId] = useState('')
+  const [modal, setModal] = useState<null | 'world' | 'chat' | 'npc' | 'user'>(null)
   const [modalValue, setModalValue] = useState('')
   const [notice, setNotice] = useState<{ title: string; body: string } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
@@ -391,6 +444,18 @@ export default function App() {
   useEffect(() => {
     document.body.dataset.theme = theme
   }, [theme])
+
+  useEffect(() => {
+    if (world?.id) localStorage.setItem('mwm:lastWorldId', world.id)
+  }, [world?.id])
+
+  useEffect(() => {
+    if (npcActorId) localStorage.setItem('mwm:lastNpcActorId', npcActorId)
+  }, [npcActorId])
+
+  useEffect(() => {
+    if (userActorId) localStorage.setItem('mwm:lastUserActorId', userActorId)
+  }, [userActorId])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -417,6 +482,55 @@ export default function App() {
       ? '输入内容后回车发送，Shift+Enter 换行。'
       : '回车发送，Shift+Enter 换行。'
 
+  const readSSE = async (
+    url: string,
+    body: Record<string, any>,
+    handlers: StreamHandlers
+  ) => {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok || !res.body) {
+      const errText = await res.text()
+      throw new Error(errText || 'Stream failed')
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let idx = buffer.indexOf('\n\n')
+      while (idx !== -1) {
+        const chunk = buffer.slice(0, idx)
+        buffer = buffer.slice(idx + 2)
+        const lines = chunk.split('\n')
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue
+          const payload = line.slice(5).trim()
+          if (!payload) continue
+          const data = JSON.parse(payload)
+          if ((data.type === 'delta' || data.type === 'npc_delta') && data.content) {
+            handlers.onDelta?.(data.content)
+          }
+          if ((data.type === 'done' || data.type === 'npc_done') && data.message) {
+            handlers.onNpcDone?.(data.message as Message)
+          }
+          if (data.type === 'user_done' && data.message) {
+            handlers.onUserDone?.(data.message as Message)
+          }
+          if (data.type === 'error') {
+            throw new Error(data.message || 'Stream error')
+          }
+        }
+        idx = buffer.indexOf('\n\n')
+      }
+    }
+  }
+
   const refreshStats = async (id: string) => {
     if (!id) return
     try {
@@ -427,11 +541,98 @@ export default function App() {
     }
   }
 
+  const loadMemoryStates = async (id: string) => {
+    if (!id) return
+    try {
+      const [npc, user] = await Promise.all([
+        api<{ mode: string; items: any[] }>(`/chats/${id}/memory/npc`),
+        api<{ mode: string; items: any[] }>(`/chats/${id}/memory/user`),
+      ])
+      setNpcMemory(npc)
+      setUserMemory(user)
+    } catch (err) {
+      // ignore memory fetch failures to avoid blocking chat load
+    }
+  }
+
+  const loadActorById = async (role: 'npc' | 'user', id: string) => {
+    if (!id.trim()) return
+    try {
+      setBusy(true)
+      setStatus(`加载 ${role} 设定中...`)
+      const data = await api<any>(`/actor/${id.trim()}`)
+      const profile = data.profile || {}
+      if (role === 'npc') {
+        setNpcActorId(data.id || id)
+        setNpcForm((prev) => ({
+          ...prev,
+          mode: profile.mode || prev.mode,
+          roleName: profile.role_name || prev.roleName,
+          userName: profile.user_name || prev.userName,
+          initRole: profile.init_role_sp || prev.initRole,
+          userInfo: profile.user_info || prev.userInfo,
+          goldenSp: profile.golden_sp || prev.goldenSp,
+          notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
+        }))
+        const ignore = new Set([
+          'role',
+          'mode',
+          'role_name',
+          'user_name',
+          'init_role_sp',
+          'user_info',
+          'golden_sp',
+          'notes',
+          'chat_id',
+        ])
+        setNpcExtras(toKVExtras(profile, ignore))
+      } else {
+        setUserActorId(data.id || id)
+        setUserForm((prev) => ({
+          ...prev,
+          displayName: profile.display_name || prev.displayName,
+          background: profile.background || prev.background,
+          persona: profile.persona || prev.persona,
+          goals: profile.goals || prev.goals,
+          constraints: profile.constraints || prev.constraints,
+          notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
+        }))
+        const ignore = new Set([
+          'role',
+          'display_name',
+          'background',
+          'persona',
+          'goals',
+          'constraints',
+          'notes',
+          'chat_id',
+        ])
+        setUserExtras(toKVExtras(profile, ignore))
+      }
+      setStatus(`${role.toUpperCase()} 设定已加载`)
+    } catch (err: any) {
+      setError(err.message)
+      setStatus('')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const loadMemoryConfig = async (id: string) => {
     if (!id) return
     try {
       const data = await api<MemoryConfig>(`/chats/${id}/memory/config`)
       setMemoryConfig(data)
+    } catch (err: any) {
+      // ignore config load errors
+    }
+  }
+
+  const loadUserMemoryConfig = async (id: string) => {
+    if (!id) return
+    try {
+      const data = await api<MemoryConfig>(`/chats/${id}/memory/config/user`)
+      setUserMemoryConfig(data)
     } catch (err: any) {
       // ignore config load errors
     }
@@ -451,6 +652,28 @@ export default function App() {
       })
       setMemoryConfig(data)
       setStatus('记忆配置已更新')
+    } catch (err: any) {
+      setError(err.message)
+      setStatus('')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const updateUserMemoryConfig = async () => {
+    if (!chatId || !userMemoryConfig) return
+    try {
+      setBusy(true)
+      setStatus('保存用户记忆配置中...')
+      const data = await api<MemoryConfig>(`/chats/${chatId}/memory/config/user`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          add_mode: userMemoryConfig.add_mode,
+          search_mode: userMemoryConfig.search_mode,
+        }),
+      })
+      setUserMemoryConfig(data)
+      setStatus('用户记忆配置已更新')
     } catch (err: any) {
       setError(err.message)
       setStatus('')
@@ -511,167 +734,247 @@ export default function App() {
     }
   }
 
-  const statsTabs: TabsProps['items'] = [
-    {
-      key: 'overview',
-      label: '总览',
-      children: stats ? (
-        <div className="stats-grid">
-          <div className="stat-card">
-            <span>轮次</span>
-            <strong>{stats.total_turns}</strong>
-          </div>
-          <div className="stat-card">
-            <span>平均欲望</span>
-            <strong>{stats.avg_desire}</strong>
-          </div>
+  const statsTabs: TabsProps['items'] = useMemo(
+    () => [
+      {
+        key: 'overview',
+        label: '总览',
+        children: stats ? (
+          <div className="stats-grid">
+            <div className="stat-card">
+              <span>轮次</span>
+              <strong>{stats.total_turns}</strong>
+            </div>
+            <div className="stat-card">
+              <span>平均欲望</span>
+              <strong>{stats.avg_desire}</strong>
+            </div>
           <div className="stat-card">
             <span>平均时长</span>
             <strong>{formatDuration(stats.avg_turn_duration_sec)}</strong>
+          </div>
+          <div className="stat-card">
+            <span>NPC 平均响应</span>
+            <strong>{formatDuration(stats.avg_npc_response_sec)}</strong>
+          </div>
+          <div className="stat-card">
+            <span>用户平均响应</span>
+            <strong>{formatDuration(stats.avg_user_response_sec)}</strong>
           </div>
           <div className="stat-card wide">
             <span>趋势摘要</span>
             <strong>{stats.trend_summary}</strong>
             <TrendBadge
               direction={stats.trend_direction}
-              delta={stats.trend_delta}
-              window={stats.trend_window}
-            />
-          </div>
-          <div className="stat-card">
-            <span>TTR</span>
-            <strong>{stats.lexical_diversity.ttr}</strong>
-          </div>
-          <div className="stat-card">
-            <span>MTLD</span>
-            <strong>{stats.lexical_diversity.mtld}</strong>
-          </div>
-          <div className="stat-card">
-            <span>话题数</span>
-            <strong>{stats.topic_diversity.unique}</strong>
-          </div>
-          <div className="stat-card">
-            <span>话题熵</span>
-            <strong>{stats.topic_diversity.entropy}</strong>
-          </div>
-        </div>
-      ) : (
-        <div className="empty">暂无数据</div>
-      ),
-    },
-    {
-      key: 'desire',
-      label: '欲望趋势',
-      children: stats ? (
-        <div className="stats-panel">
-          <div className="stat-row">
-            <span>趋势摘要: {stats.trend_summary}</span>
-            <TrendBadge
-              direction={stats.trend_direction}
-              delta={stats.trend_delta}
-              window={stats.trend_window}
-            />
-          </div>
-          <ChartLine values={stats.desire_series} />
-        </div>
-      ) : (
-        <div className="empty">暂无数据</div>
-      ),
-    },
-    {
-      key: 'emotion',
-      label: '情绪分布',
-      children: stats ? (
-        <div className="stats-panel">
-          <ChartBars data={stats.emotion_distribution} />
-        </div>
-      ) : (
-        <div className="empty">暂无数据</div>
-      ),
-    },
-    {
-      key: 'config',
-      label: '配置',
-      children: (
-        <div className="config-panel">
-          <div className="config-block">
-            <div className="config-title">记忆模式</div>
-            <div className="config-row">
-              <div className="config-label">add_memory</div>
-              <Select
-                value={memoryConfig?.add_mode}
-                options={(memoryConfig?.supported_add_modes || []).map((value) => ({
-                  value,
-                  label: value,
-                }))}
-                disabled={!chatId || busy || !memoryConfig}
-                onChange={(value) =>
-                  setMemoryConfig((prev) =>
-                    prev ? { ...prev, add_mode: value } : prev
-                  )
-                }
+                delta={stats.trend_delta}
+                window={stats.trend_window}
               />
             </div>
-            <div className="config-row">
-              <div className="config-label">search_memory</div>
-              <Select
-                value={memoryConfig?.search_mode}
-                options={(memoryConfig?.supported_search_modes || []).map((value) => ({
-                  value,
-                  label: value,
-                }))}
-                disabled={!chatId || busy || !memoryConfig}
-                onChange={(value) =>
-                  setMemoryConfig((prev) =>
-                    prev ? { ...prev, search_mode: value } : prev
-                  )
-                }
+            <div className="stat-card">
+              <span>TTR</span>
+              <strong>{stats.lexical_diversity.ttr}</strong>
+            </div>
+            <div className="stat-card">
+              <span>MTLD</span>
+              <strong>{stats.lexical_diversity.mtld}</strong>
+            </div>
+            <div className="stat-card">
+              <span>话题数</span>
+              <strong>{stats.topic_diversity.unique}</strong>
+            </div>
+            <div className="stat-card">
+              <span>话题熵</span>
+              <strong>{stats.topic_diversity.entropy}</strong>
+            </div>
+          </div>
+        ) : (
+          <div className="empty">暂无数据</div>
+        ),
+      },
+      {
+        key: 'desire',
+        label: '欲望趋势',
+        children: stats ? (
+          <div className="stats-panel">
+            <div className="stat-row">
+              <span>趋势摘要: {stats.trend_summary}</span>
+              <TrendBadge
+                direction={stats.trend_direction}
+                delta={stats.trend_delta}
+                window={stats.trend_window}
               />
             </div>
-            <Button className="ghost" onClick={updateMemoryConfig} disabled={!chatId || busy || !memoryConfig}>
-              保存记忆配置
-            </Button>
+            <ChartLine values={stats.desire_series} />
           </div>
+        ) : (
+          <div className="empty">暂无数据</div>
+        ),
+      },
+      {
+        key: 'emotion',
+        label: '情绪分布',
+        children: stats ? (
+          <div className="stats-panel">
+            <ChartBars data={stats.emotion_distribution} />
+          </div>
+        ) : (
+          <div className="empty">暂无数据</div>
+        ),
+      },
+      {
+        key: 'tempo',
+        label: '对话节奏',
+        children: stats ? (
+          <div className="stats-panel">
+            <div className="stat-row">
+              <span>平均轮次时长: {formatDuration(stats.avg_turn_duration_sec)}</span>
+              <span>NPC 响应: {formatDuration(stats.avg_npc_response_sec)}</span>
+              <span>用户响应: {formatDuration(stats.avg_user_response_sec)}</span>
+            </div>
+            <ChartLineAny values={stats.per_turn_durations} />
+            <div className="response-list">
+              <div className="response-header">轮次响应明细</div>
+              {stats.per_turn_responses.length ? (
+                <div className="response-table">
+                  {stats.per_turn_responses.map((r, idx) => (
+                    <div key={`${r.turn_index}-${idx}`} className="response-row">
+                      <span>第 {r.turn_index} 轮</span>
+                      <Tag className="pill">
+                        {r.direction === 'user_to_npc' ? '用户 → NPC' : 'NPC → 用户'}
+                      </Tag>
+                      <span>{formatDuration(r.response_sec)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="empty">暂无响应明细</div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="empty">暂无数据</div>
+        ),
+      },
+      {
+        key: 'config',
+        label: '配置',
+        children: (
+          <div className="config-panel">
+            <div className="config-block">
+              <div className="config-title">记忆模式</div>
+              <div className="config-row">
+                <div className="config-label">add_memory</div>
+                <Select
+                  value={memoryConfig?.add_mode}
+                  options={(memoryConfig?.supported_add_modes || []).map((value) => ({
+                    value,
+                    label: value,
+                  }))}
+                  disabled={!chatId || busy || !memoryConfig}
+                  onChange={(value) =>
+                    setMemoryConfig((prev) => (prev ? { ...prev, add_mode: value } : prev))
+                  }
+                />
+              </div>
+              <div className="config-row">
+                <div className="config-label">search_memory</div>
+                <Select
+                  value={memoryConfig?.search_mode}
+                  options={(memoryConfig?.supported_search_modes || []).map((value) => ({
+                    value,
+                    label: value,
+                  }))}
+                  disabled={!chatId || busy || !memoryConfig}
+                  onChange={(value) =>
+                    setMemoryConfig((prev) => (prev ? { ...prev, search_mode: value } : prev))
+                  }
+                />
+              </div>
+              <Button className="ghost" onClick={updateMemoryConfig} disabled={!chatId || busy || !memoryConfig}>
+                保存记忆配置
+              </Button>
+            </div>
 
-          <div className="config-block">
-            <div className="config-title">Session 时间</div>
-            <div className="config-row">
-              <div className="config-label">session_time</div>
-              <Input
-                value={sessionConfig?.session_time || ''}
-                disabled={!chatId || busy || !sessionConfig}
-                onChange={(e) =>
-                  setSessionConfig((prev) =>
-                    prev ? { ...prev, session_time: e.target.value } : prev
-                  )
-                }
-                placeholder="YYYY-MM-DD HH:mm:ss"
-              />
+            <div className="config-block">
+              <div className="config-title">用户记忆模式</div>
+              <div className="config-row">
+                <div className="config-label">add_memory</div>
+                <Select
+                  value={userMemoryConfig?.add_mode}
+                  options={(userMemoryConfig?.supported_add_modes || []).map((value) => ({
+                    value,
+                    label: value,
+                  }))}
+                  disabled={!chatId || busy || !userMemoryConfig}
+                  onChange={(value) =>
+                    setUserMemoryConfig((prev) => (prev ? { ...prev, add_mode: value } : prev))
+                  }
+                />
+              </div>
+              <div className="config-row">
+                <div className="config-label">search_memory</div>
+                <Select
+                  value={userMemoryConfig?.search_mode}
+                  options={(userMemoryConfig?.supported_search_modes || []).map((value) => ({
+                    value,
+                    label: value,
+                  }))}
+                  disabled={!chatId || busy || !userMemoryConfig}
+                  onChange={(value) =>
+                    setUserMemoryConfig((prev) => (prev ? { ...prev, search_mode: value } : prev))
+                  }
+                />
+              </div>
+              <Button
+                className="ghost"
+                onClick={updateUserMemoryConfig}
+                disabled={!chatId || busy || !userMemoryConfig}
+              >
+                保存用户记忆配置
+              </Button>
             </div>
-            <Button className="ghost" onClick={updateSessionConfig} disabled={!chatId || busy || !sessionConfig}>
-              保存 Session 时间
-            </Button>
-          </div>
 
-          <div className="config-block">
-            <div className="config-title">导出会话</div>
-            <div className="config-row">
-              <div className="config-label">session_id</div>
-              <Input
-                value={downloadId}
-                disabled={busy}
-                onChange={(e) => setDownloadId(e.target.value)}
-                placeholder="输入 session/chat id"
-              />
+            <div className="config-block">
+              <div className="config-title">Session 时间</div>
+              <div className="config-row">
+                <div className="config-label">session_time</div>
+                <Input
+                  value={sessionConfig?.session_time || ''}
+                  disabled={!chatId || busy || !sessionConfig}
+                  onChange={(e) =>
+                    setSessionConfig((prev) =>
+                      prev ? { ...prev, session_time: e.target.value } : prev
+                    )
+                  }
+                  placeholder="YYYY-MM-DD HH:mm:ss"
+                />
+              </div>
+              <Button className="ghost" onClick={updateSessionConfig} disabled={!chatId || busy || !sessionConfig}>
+                保存 Session 时间
+              </Button>
             </div>
-            <Button type="primary" onClick={downloadSession} disabled={busy || !downloadId.trim()}>
-              下载 JSON
-            </Button>
+
+            <div className="config-block">
+              <div className="config-title">导出会话</div>
+              <div className="config-row">
+                <div className="config-label">session_id</div>
+                <Input
+                  value={downloadId}
+                  disabled={busy}
+                  onChange={(e) => setDownloadId(e.target.value)}
+                  placeholder="输入 session/chat id"
+                />
+              </div>
+              <Button type="primary" onClick={downloadSession} disabled={busy || !downloadId.trim()}>
+                下载 JSON
+              </Button>
+            </div>
           </div>
-        </div>
-      ),
-    },
-  ]
+        ),
+      },
+    ],
+    [stats, memoryConfig, userMemoryConfig, sessionConfig, downloadId, chatId, busy]
+  )
 
   const loadWorldById = async (id: string, silent?: boolean) => {
     if (!id.trim()) return
@@ -759,8 +1062,10 @@ export default function App() {
         // Ignore actor auto-fill failures to avoid blocking chat load
       }
       await loadMemoryConfig(id)
+      await loadUserMemoryConfig(id)
       await loadSessionConfig(id)
       await refreshStats(id)
+      await loadMemoryStates(id)
       setStatus('对话已加载')
     } catch (err: any) {
       setError(err.message)
@@ -788,27 +1093,70 @@ export default function App() {
     })
   }
 
+  const generateNpcForWorld = async (snapshot: any, style: string) => {
+    try {
+      setStatus('生成 NPC 设定中...')
+      const data = await api<{ profile: Record<string, any> }>('/npc/generate', {
+        method: 'POST',
+        body: JSON.stringify({ world: snapshot, style }),
+      })
+      const profile = data.profile || {}
+      setNpcActorId('')
+      setNpcForm((prev) => ({
+        ...prev,
+        mode: profile.mode || prev.mode,
+        roleName: profile.role_name || prev.roleName,
+        userName: profile.user_name || prev.userName,
+        initRole: profile.init_role_sp || prev.initRole,
+        userInfo: profile.user_info || prev.userInfo,
+        goldenSp: profile.golden_sp || prev.goldenSp,
+        notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
+      }))
+      const ignore = new Set([
+        'role',
+        'mode',
+        'role_name',
+        'user_name',
+        'init_role_sp',
+        'user_info',
+        'golden_sp',
+        'notes',
+      ])
+      setNpcExtras(toKVExtras(profile, ignore))
+      setStatus('NPC 设定已生成')
+    } catch (err: any) {
+      setStatus('世界已生成')
+    }
+  }
+
   const createWorld = async () => {
     setError('')
     setStatus('生成世界中...')
     setBusy(true)
     try {
+      const style =
+        theme === 'town' ? 'pixel' : theme === 'dream' ? 'dreamy' : theme === 'pixel' ? 'pixel' : 'gothic'
       const data = await api<World>('/worlds/generate', {
         method: 'POST',
         body: JSON.stringify({
           seed_prompt: '',
-          style:
-            theme === 'town' ? 'pixel' : theme === 'dream' ? 'dreamy' : theme === 'pixel' ? 'pixel' : 'gothic',
+          style,
         }),
       })
       setWorld(data)
       setWorldForm(worldFormFromSnapshot(data.snapshot))
+      setChatId('')
+      setMessages([])
+      setStats(null)
+      setMemoryConfig(null)
+      setSessionConfig(null)
+      setDownloadId('')
       setStatus('世界已生成')
       setNotice({
         title: 'World 已生成',
         body: `World ID: ${data.id}\n下次可在左上角“加载世界”中恢复。`,
       })
-      await createChatForWorld(data.id)
+      await generateNpcForWorld(data.snapshot, style)
     } catch (err: any) {
       setError(err.message)
       setStatus('')
@@ -889,6 +1237,7 @@ export default function App() {
         if (last.role !== 'user') return last.turn_index
         return last.turn_index + 1
       })()
+      const npcTempId = `temp-npc-${Date.now()}`
       setMessages((prev) => [
         ...prev,
         {
@@ -898,22 +1247,43 @@ export default function App() {
           turn_index: tempTurn,
           created_at: new Date().toISOString(),
         },
+        {
+          id: npcTempId,
+          role: 'npc',
+          content: '',
+          turn_index: tempTurn,
+          created_at: new Date().toISOString(),
+        },
       ])
-      await api(`/chats/${chatId}/message`, {
-        method: 'POST',
-        body: JSON.stringify({ role: 'user', content: text, desire_score: inputDesire }),
-      })
-      try {
-        await api(`/chats/${chatId}/auto/one`, { method: 'POST' })
-      } catch (err) {
-        // Ignore auto-reply failures to keep user message persisted
+      const appendNpc = (delta: string) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === npcTempId ? { ...m, content: `${m.content || ''}${delta}` } : m
+          )
+        )
       }
+      const finalizeNpc = (msg: Message) => {
+        setNpcStreamingId('')
+        setMessages((prev) =>
+          prev.map((m) => (m.id === npcTempId ? { ...m, ...msg } : m))
+        )
+      }
+      setNpcStreamingId(npcTempId)
+      await readSSE(`${API_BASE}/chats/${chatId}/message/stream`, {
+        role: 'user',
+        content: text,
+        desire_score: inputDesire,
+      }, {
+        onDelta: appendNpc,
+        onNpcDone: finalizeNpc,
+      })
       await loadChatById(chatId)
       setStatus('已发送')
     } catch (err: any) {
       setError(err.message)
       setInputText(text)
       setMessages((prev) => prev.filter((m) => !m.id.startsWith('temp-')))
+      setNpcStreamingId('')
       setStatus('')
     } finally {
       setBusy(false)
@@ -929,7 +1299,7 @@ export default function App() {
     try {
       setBusy(true)
       setStatus(`自动对话（${steps}轮）...`)
-      await api(`/chats/${chatId}/auto/step`, { method: 'POST', body: JSON.stringify({ max_steps: steps }) })
+      await streamAuto(`/chats/${chatId}/auto/step/stream`, { max_steps: steps, desire_stop: 4 })
       await loadChatById(chatId)
       setStatus('完成')
     } catch (err: any) {
@@ -948,9 +1318,9 @@ export default function App() {
     try {
       setBusy(true)
       setStatus('自动对话中...')
-      await api(`/chats/${chatId}/auto/until`, {
-        method: 'POST',
-        body: JSON.stringify({ max_steps: 30, desire_stop: 5 }),
+      await streamAuto(`/chats/${chatId}/auto/until/stream`, {
+        max_steps: 30,
+        desire_stop: 4,
       })
       await loadChatById(chatId)
       setStatus('完成')
@@ -960,6 +1330,53 @@ export default function App() {
     } finally {
       setBusy(false)
     }
+  }
+
+  const streamAuto = async (path: string, payload: Record<string, any>) => {
+    let npcTempId = `temp-npc-${Date.now()}`
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: npcTempId,
+        role: 'npc',
+        content: '',
+        turn_index: prev.length ? prev[prev.length - 1].turn_index : 1,
+        created_at: new Date().toISOString(),
+      },
+    ])
+    setNpcStreamingId(npcTempId)
+    await readSSE(`${API_BASE}${path}`, payload, {
+      onDelta: (delta) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === npcTempId ? { ...m, content: `${m.content || ''}${delta}` } : m
+          )
+        )
+      },
+      onNpcDone: (msg) => {
+        setNpcStreamingId('')
+        setMessages((prev) =>
+          prev.map((m) => (m.id === npcTempId ? { ...m, ...msg } : m))
+        )
+      },
+      onUserDone: (msg) => {
+        setMessages((prev) => [...prev, msg])
+        npcTempId = `temp-npc-${Date.now()}`
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: npcTempId,
+            role: 'npc',
+            content: '',
+            turn_index: msg.turn_index,
+            created_at: new Date().toISOString(),
+          },
+        ])
+        setNpcStreamingId(npcTempId)
+      },
+    })
+    setMessages((prev) => prev.filter((m) => !(m.id.startsWith('temp-npc') && !m.content)))
+    setNpcStreamingId('')
   }
 
   const buildNpcProfile = () => ({
@@ -1013,7 +1430,7 @@ export default function App() {
     }
   }
 
-  const openModal = (type: 'world' | 'chat') => {
+  const openModal = (type: 'world' | 'chat' | 'npc' | 'user') => {
     setModalValue('')
     setModal(type)
   }
@@ -1023,10 +1440,22 @@ export default function App() {
     if (!id) return
     if (modal === 'world') await loadWorldById(id)
     if (modal === 'chat') await loadChatById(id)
+    if (modal === 'npc') await loadActorById('npc', id)
+    if (modal === 'user') await loadActorById('user', id)
     setModal(null)
   }
 
   const roleLabel = (role: string) => (role === 'npc' ? 'NPC' : role === 'user' ? '用户' : role)
+
+  const copyText = async (label: string, value: string) => {
+    if (!value) return
+    try {
+      await navigator.clipboard.writeText(value)
+      setNotice({ title: '已复制', body: `${label}: ${value}` })
+    } catch (err) {
+      setError('复制失败，请手动复制')
+    }
+  }
 
   return (
     <div className="app">
@@ -1034,11 +1463,29 @@ export default function App() {
       <div className="fog-layer" aria-hidden />
       <header className="topbar">
         <div className="brand">
-          <div className="title">记忆织城</div>
+          <div className="title">DreamSphere</div>
           <div className="subtitle">Town Dialogue Atelier</div>
         </div>
         <div className="top-meta">
-          <div className="status-pill">{status || `API: ${API_BASE}`}</div>
+          <div className="id-row">
+            <span className="id-chip">
+              World ID: <strong>{world?.id || '—'}</strong>
+              {world?.id ? (
+                <Button size="small" className="ghost mini" onClick={() => copyText('World ID', world.id)}>
+                  复制
+                </Button>
+              ) : null}
+            </span>
+            <span className="id-chip">
+              Chat ID: <strong>{chatId || '—'}</strong>
+              {chatId ? (
+                <Button size="small" className="ghost mini" onClick={() => copyText('Chat ID', chatId)}>
+                  复制
+                </Button>
+              ) : null}
+            </span>
+            <span className="status-pill">{status || `API: ${API_BASE}`}</span>
+          </div>
           <div className="theme-switch">
             <span>风格</span>
             <Select
@@ -1051,6 +1498,7 @@ export default function App() {
                 { value: 'dream', label: '造梦次元' },
                 { value: 'gothic', label: '第五人格' },
                 { value: 'pixel', label: '像素街区' },
+                { value: 'nebula', label: '星云夜空' },
               ]}
             />
           </div>
@@ -1066,10 +1514,29 @@ export default function App() {
               <div>
                 <h3>World Model</h3>
                 <div className="panel-sub">
-                  版本 {world?.version ?? '-'} · {world?.id ? `ID ${world.id.slice(0, 8)}` : '未生成'}
+                  版本 {world?.version ?? '-'} · {world?.id ? `ID ${world.id}` : '未生成'}
                 </div>
               </div>
               <div className="panel-actions">
+                <Select
+                  className="ghost"
+                  size="small"
+                  placeholder="选择预设"
+                  value={undefined}
+                  disabled={busy}
+                  options={[
+                    ...(world?.id ? [{ value: world.id, label: `当前 World (${world.id.slice(0, 6)}...)` }] : []),
+                    ...(localStorage.getItem('mwm:lastWorldId')
+                      ? [
+                          {
+                            value: localStorage.getItem('mwm:lastWorldId') as string,
+                            label: '最近 World',
+                          },
+                        ]
+                      : []),
+                  ]}
+                  onChange={(value) => loadWorldById(value)}
+                />
                 <Button type="primary" onClick={createWorld} disabled={busy}>
                   生成世界
                 </Button>
@@ -1085,9 +1552,6 @@ export default function App() {
               {!world ? (
                 <div className="empty">
                   请先生成或加载 World。
-                  <Button className="ghost subtle" onClick={createWorld} disabled={busy}>
-                    立即生成
-                  </Button>
                 </div>
               ) : (
                 <div className="stack">
@@ -1179,8 +1643,30 @@ export default function App() {
                 <div className="panel-sub">驱动 NPC 的视角与说话风格</div>
               </div>
               <div className="panel-actions">
+                <Select
+                  className="ghost"
+                  size="small"
+                  placeholder="预设"
+                  value={undefined}
+                  disabled={busy}
+                  options={[
+                    ...(npcActorId ? [{ value: npcActorId, label: `当前 NPC (${npcActorId.slice(0, 6)}...)` }] : []),
+                    ...(localStorage.getItem('mwm:lastNpcActorId')
+                      ? [
+                          {
+                            value: localStorage.getItem('mwm:lastNpcActorId') as string,
+                            label: '最近 NPC',
+                          },
+                        ]
+                      : []),
+                  ]}
+                  onChange={(value) => loadActorById('npc', value)}
+                />
                 <Button type="primary" onClick={() => saveActor('npc')} disabled={busy}>
                   保存设定
+                </Button>
+                <Button className="ghost" onClick={() => openModal('npc')} disabled={busy}>
+                  加载设定
                 </Button>
               </div>
             </div>
@@ -1261,6 +1747,21 @@ export default function App() {
                   disabled={busy}
                 />
               </details>
+              <details>
+                <summary>NPC 记忆</summary>
+                <div className="memory-box">
+                  {npcMemory?.items?.length ? (
+                    npcMemory.items.slice(-8).map((item, idx) => (
+                      <div key={`npc-mem-${idx}`} className="memory-item">
+                        <span className="memory-role">{item.role}</span>
+                        <span className="memory-text">{item.content}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="empty">暂无记忆</div>
+                  )}
+                </div>
+              </details>
             </div>
           </section>
         </div>
@@ -1272,45 +1773,57 @@ export default function App() {
                 <h3>对话窗口</h3>
                 <div className="panel-sub">
                   {world?.name ? `世界: ${world.name}` : '未绑定世界'} ·{' '}
-                  {chatId ? `会话 ${chatId.slice(0, 6)}` : '未加载会话'}
+                  {chatId ? `会话 ${chatId}` : '未加载会话'}
                 </div>
               </div>
-              <div className="panel-actions">
+              <div className="panel-actions chat-actions">
                 <Button type="primary" onClick={createChat} disabled={!world || busy}>
-                  新建对话
+                  开始新对话
                 </Button>
                 <Button className="ghost" onClick={() => openModal('chat')} disabled={busy}>
                   加载对话
                 </Button>
-                <Button className="ghost" onClick={() => autoRound(1)} disabled={busy || !chatId}>
-                  自动对话（1轮）
-                </Button>
-                <Button className="ghost" onClick={() => autoRound(10)} disabled={busy || !chatId}>
-                  自动对话（10轮）
-                </Button>
-                <Button className="play" onClick={autoUntil} disabled={busy || !chatId} title="自动对话">
-                  ▶ 直到不想继续
-                </Button>
+                <div className="action-group">
+                  <Button className="ghost" onClick={() => autoRound(1)} disabled={busy || !chatId}>
+                    1轮
+                  </Button>
+                  <Button className="ghost" onClick={() => autoRound(10)} disabled={busy || !chatId}>
+                    10轮
+                  </Button>
+                  <Button className="play" onClick={autoUntil} disabled={busy || !chatId} title="自动对话">
+                    ▶ 直到不想继续
+                  </Button>
+                </div>
               </div>
             </div>
             <div className="scene-strip">
               <span className="scene-label">场景</span>
               <span className="scene-text">{worldForm.sceneSetting || '未设置场景'}</span>
             </div>
-            <div className="scene-window">
-              <div className="scene-grid">
-                <span className="scene-icon npc">N</span>
-                <span className="scene-icon user">U</span>
-              </div>
-              <div className="scene-bubble">地图同步中 · 事件线索可视化</div>
-            </div>
             <div className="panel-body scroll">
               {messageList.length === 0 ? (
-                <div className="empty">暂无对话，先创建或加载一个对话。</div>
+                <div className="empty-state">
+                  <div className="empty-title">还没有对话</div>
+                  <div className="empty-sub">先开始新对话或加载会话，NPC 会主动开场。</div>
+                  <div className="empty-actions">
+                    <Button type="primary" onClick={createChat} disabled={!world || busy}>
+                      开始新对话
+                    </Button>
+                    <Button className="ghost" onClick={() => openModal('chat')} disabled={busy}>
+                      加载对话
+                    </Button>
+                    <Button className="ghost" onClick={() => autoRound(1)} disabled={busy || !chatId}>
+                      自动对话（1轮）
+                    </Button>
+                  </div>
+                </div>
               ) : (
                 <div className="messages">
                   {messageList.map((m) => (
-                    <div key={m.id} className={`message-row ${m.role}`}>
+                    <div
+                      key={m.id}
+                      className={`message-row ${m.role} ${m.id.startsWith('temp-npc') ? 'streaming' : ''}`}
+                    >
                       <div className="avatar">{roleLabel(m.role).slice(0, 1)}</div>
                       <div className="message-card">
                         <div className="message-meta">
@@ -1320,7 +1833,20 @@ export default function App() {
                           {m.topic_tag ? <Tag className="pill">{m.topic_tag}</Tag> : null}
                           {m.desire_score ? <Tag className="pill">欲望 {m.desire_score}</Tag> : null}
                         </div>
-                        <div className="message-text">{m.content}</div>
+                        <div className="message-text">
+                          {m.content ? (
+                            <>
+                              {m.content}
+                              {m.id === npcStreamingId ? <span className="typing-cursor" /> : null}
+                            </>
+                          ) : m.id === npcStreamingId ? (
+                            <span className="typing-dots">
+                              <span />
+                              <span />
+                              <span />
+                            </span>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1362,7 +1888,7 @@ export default function App() {
                   }}
                 />
                 <div className="composer-side">
-                  <label>继续欲望</label>
+                  <label>继续意愿</label>
                   <div className="range-row">
                     <Slider
                       min={1}
@@ -1388,8 +1914,30 @@ export default function App() {
                 <div className="panel-sub">用户视角信息与目标</div>
               </div>
               <div className="panel-actions">
+                <Select
+                  className="ghost"
+                  size="small"
+                  placeholder="预设"
+                  value={undefined}
+                  disabled={busy}
+                  options={[
+                    ...(userActorId ? [{ value: userActorId, label: `当前用户 (${userActorId.slice(0, 6)}...)` }] : []),
+                    ...(localStorage.getItem('mwm:lastUserActorId')
+                      ? [
+                          {
+                            value: localStorage.getItem('mwm:lastUserActorId') as string,
+                            label: '最近用户',
+                          },
+                        ]
+                      : []),
+                  ]}
+                  onChange={(value) => loadActorById('user', value)}
+                />
                 <Button type="primary" onClick={() => saveActor('user')} disabled={busy}>
                   保存设定
+                </Button>
+                <Button className="ghost" onClick={() => openModal('user')} disabled={busy}>
+                  加载设定
                 </Button>
               </div>
             </div>
@@ -1454,6 +2002,21 @@ export default function App() {
                   disabled={busy}
                 />
               </details>
+              <details>
+                <summary>用户记忆</summary>
+                <div className="memory-box">
+                  {userMemory?.items?.length ? (
+                    userMemory.items.slice(-8).map((item, idx) => (
+                      <div key={`user-mem-${idx}`} className="memory-item">
+                        <span className="memory-role">{item.role}</span>
+                        <span className="memory-text">{item.content}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="empty">暂无记忆</div>
+                  )}
+                </div>
+              </details>
             </div>
           </section>
 
@@ -1470,13 +2033,9 @@ export default function App() {
               </div>
             </div>
             <div className="panel-body scroll">
-              {chatId ? (
-                <div className="stats">
-                  <Tabs items={statsTabs} />
-                </div>
-              ) : (
-                <div className="empty">暂无数据</div>
-              )}
+              <div className="stats">
+                <Tabs items={statsTabs} />
+              </div>
             </div>
           </section>
         </div>
@@ -1484,7 +2043,15 @@ export default function App() {
 
       <Modal
         open={modal !== null}
-        title={modal === 'world' ? '加载 World' : '加载对话'}
+        title={
+          modal === 'world'
+            ? '加载 World'
+            : modal === 'chat'
+              ? '加载对话'
+              : modal === 'npc'
+                ? '加载 NPC 设定'
+                : '加载用户设定'
+        }
         onCancel={() => setModal(null)}
         onOk={confirmModal}
         okText="加载"
@@ -1494,10 +2061,22 @@ export default function App() {
         <p className="muted">
           {modal === 'world'
             ? '输入已有的 World ID，左侧内容会自动填充。'
-            : '输入已有的 Chat ID，系统会同步加载对应 World。'}
+            : modal === 'chat'
+              ? '输入已有的 Chat ID，系统会同步加载对应 World。'
+              : modal === 'npc'
+                ? '输入已有的 NPC Actor ID，将覆盖当前 NPC 设定。'
+                : '输入已有的 User Actor ID，将覆盖当前用户设定。'}
         </p>
         <Input
-          placeholder={modal === 'world' ? 'World ID' : 'Chat ID'}
+          placeholder={
+            modal === 'world'
+              ? 'World ID'
+              : modal === 'chat'
+                ? 'Chat ID'
+                : modal === 'npc'
+                  ? 'NPC Actor ID'
+                  : 'User Actor ID'
+          }
           value={modalValue}
           onChange={(e) => setModalValue(e.target.value)}
         />

@@ -80,6 +80,14 @@ class MemoryConfig(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class UserMemoryConfig(SQLModel, table=True):
+    __tablename__ = "user_memory_configs"
+    chat_id: str = Field(primary_key=True)
+    add_mode: str = Field(default="last_60")
+    search_mode: str = Field(default="last_60")
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class SessionConfig(SQLModel, table=True):
     __tablename__ = "session_configs"
     chat_id: str = Field(primary_key=True)

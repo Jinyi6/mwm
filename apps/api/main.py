@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List
+import re
+import json
+import logging
+import time
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from sqlmodel import select
 
 from .db import init_db, get_session
@@ -21,12 +27,17 @@ from .schemas import (
     MemoryConfigResponse,
     SessionConfigUpdate,
     SessionConfigResponse,
+    NpcGenerateRequest,
+    NpcGenerateResponse,
 )
 from .utils import new_id, new_session_id, dumps_json, loads_json, clamp_int
 from .llm import (
     generate_world,
+    generate_npc_profile,
     generate_npc_reply,
     generate_npc_reply_with_sp,
+    generate_npc_reply_stream,
+    generate_npc_reply_stream_with_sp,
     generate_user_reply,
     classify_emotion_llm,
     tag_topic_llm,
@@ -36,6 +47,8 @@ from .memory import (
     rule_topic,
     update_memory,
     search_memory,
+    get_memory,
+    DEFAULT_ADD_MODE,
     get_memory_config,
     set_memory_config,
     supported_add_modes,
@@ -45,6 +58,57 @@ from .stats import compute_stats
 
 app = FastAPI(title="AI Town Lite")
 
+logger = logging.getLogger("mwm.api")
+
+WORLD_CACHE: Dict[tuple, Dict[str, Any]] = {}
+HISTORY_CACHE: Dict[tuple, tuple[float, List[Dict[str, Any]]]] = {}
+STATS_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+CACHE_TTL_SEC = 2.0
+
+
+def _world_snapshot_cached(world: WorldModel) -> Dict[str, Any]:
+    key = (world.id, world.version)
+    cached = WORLD_CACHE.get(key)
+    if cached is not None:
+        return cached
+    snapshot = loads_json(world.snapshot_json, {})
+    WORLD_CACHE[key] = snapshot
+    return snapshot
+
+
+def _history_cached(session, chat_id: str, role: str, search_mode: str) -> List[Dict[str, Any]]:
+    key = (chat_id, role, search_mode)
+    now = time.time()
+    cached = HISTORY_CACHE.get(key)
+    if cached and now - cached[0] < CACHE_TTL_SEC:
+        return cached[1]
+    items = _recent_history(session, chat_id, role, search_mode)
+    HISTORY_CACHE[key] = (now, items)
+    return items
+
+
+def _stats_cached(session, chat_id: str) -> Dict[str, Any]:
+    now = time.time()
+    cached = STATS_CACHE.get(chat_id)
+    if cached and now - cached[0] < CACHE_TTL_SEC:
+        return cached[1]
+    stats = compute_stats(session, chat_id)
+    STATS_CACHE[chat_id] = (now, stats)
+    return stats
+
+
+def _invalidate_chat_cache(chat_id: str) -> None:
+    STATS_CACHE.pop(chat_id, None)
+    for key in list(HISTORY_CACHE.keys()):
+        if key[0] == chat_id:
+            HISTORY_CACHE.pop(key, None)
+
+
+def _invalidate_world_cache(world_id: str) -> None:
+    for key in list(WORLD_CACHE.keys()):
+        if key[0] == world_id:
+            WORLD_CACHE.pop(key, None)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -52,6 +116,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = (time.time() - start) * 1000
+    logger.info("%s %s %s %.1fms", request.method, request.url.path, response.status_code, duration)
+    return response
 
 
 @app.on_event("startup")
@@ -142,6 +215,12 @@ def world_generate(payload: WorldGenerateRequest) -> WorldResponse:
         return WorldResponse(id=world.id, name=world.name, snapshot=snapshot, version=world.version)
 
 
+@app.post("/npc/generate", response_model=NpcGenerateResponse)
+def npc_generate(payload: NpcGenerateRequest) -> NpcGenerateResponse:
+    profile = generate_npc_profile(payload.world, payload.style)
+    return NpcGenerateResponse(profile=profile)
+
+
 @app.post("/worlds", response_model=WorldResponse)
 def world_create(payload: WorldCreate) -> WorldResponse:
     snapshot = _normalize_world(payload.snapshot)
@@ -164,7 +243,7 @@ def world_get(world_id: str) -> WorldResponse:
         world = session.get(WorldModel, world_id)
         if not world:
             raise HTTPException(status_code=404, detail="world not found")
-        snapshot = _normalize_world(loads_json(world.snapshot_json, {}))
+        snapshot = _normalize_world(_world_snapshot_cached(world))
         return WorldResponse(id=world.id, name=world.name, snapshot=snapshot, version=world.version)
 
 
@@ -203,6 +282,7 @@ def world_patch(world_id: str, payload: WorldPatch) -> WorldResponse:
         )
         session.add(event)
         world.snapshot_json = dumps_json(snapshot)
+        _invalidate_world_cache(world.id)
         world.version = new_version
         session.commit()
         return WorldResponse(id=world.id, name=world.name, snapshot=snapshot, version=world.version)
@@ -268,6 +348,25 @@ def _build_context(world: Dict[str, Any], history: List[Dict[str, Any]], actor_p
     )
 
 
+def _build_user_context(history: List[Dict[str, Any]], actor_profile: Dict[str, Any]) -> str:
+    return (
+        "Profile:\n" + dumps_json(actor_profile) +
+        "\nHistory:\n" + dumps_json(history)
+    )
+
+
+def _recent_context(session, chat_id: str, limit: int = 60) -> List[Dict[str, Any]]:
+    stmt = (
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    )
+    items = session.exec(stmt).all()
+    items = list(reversed(items))
+    return [{"role": m.role, "content": m.content} for m in items]
+
+
 def _volc_sp_from_profile(world: Dict[str, Any], npc_profile: Dict[str, Any]) -> str:
     role_name = npc_profile.get("role_name", "NPC")
     user_name = npc_profile.get("user_name", "用户")
@@ -277,7 +376,10 @@ def _volc_sp_from_profile(world: Dict[str, Any], npc_profile: Dict[str, Any]) ->
     defaults = [
         "你使用口语进行表达，必要时可用括号描述动作和情绪。",
         "你需要尽可能引导用户跟你进行交流，你不应该表现地太AI。",
-        "每次回复推进剧情，提出问题或下一步行动。",
+        "每次回复推进剧情，提出问题或下一步行动，抛出具体线索或选择。",
+        "避免重复上一轮NPC内容或问句；若用户已回应，请确认并给出新进展。",
+        "避免使用“你怎么想/你怎么看/你觉得呢”等泛问句，改用具体行动或选择。",
+        "仅使用中文回答。",
     ]
     if not golden_sp:
         golden_sp = "\n".join(defaults)
@@ -336,13 +438,201 @@ def _topic_for_text(text: str) -> str:
     return rule_topic(text)
 
 
+def _norm_text(text: str) -> str:
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+def _split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = re.split(r"([。！？!?；;])", text)
+    sentences: List[str] = []
+    buf = ""
+    for part in parts:
+        if not part:
+            continue
+        if part in "。！？!?；;":
+            buf = f"{buf}{part}"
+            if buf.strip():
+                sentences.append(buf.strip())
+            buf = ""
+        else:
+            buf = f"{buf}{part}" if buf else part
+    if buf.strip():
+        sentences.append(buf.strip())
+    return sentences
+
+
+def _last_sentence(text: str) -> str:
+    parts = re.split(r"[。！？!?；;]\s*", (text or "").strip())
+    for part in reversed(parts):
+        part = part.strip()
+        if part:
+            return part
+    return ""
+
+
+def _dedupe_phrases(text: str) -> str:
+    if not text:
+        return text
+    phrases = (
+        "你怎么想的呢",
+        "你怎么想的",
+        "你怎么看",
+        "你觉得呢",
+        "你觉得",
+        "你会怎么做",
+        "你会怎么办",
+        "你要怎么做",
+        "你要不要",
+        "你愿意吗",
+        "你可以吗",
+    )
+    for phrase in phrases:
+        if text.count(phrase) > 1:
+            first = text.find(phrase)
+            text = f"{text[: first + len(phrase)]}{text[first + len(phrase):].replace(phrase, '')}"
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    text = re.sub(r"([，,]){2,}", "，", text)
+    text = re.sub(r"^[，,\s]+", "", text)
+    return text.strip()
+
+
+def _strip_repeated_tail(prev: str, curr: str) -> str:
+    tail = _last_sentence(prev)
+    if tail and len(tail) >= 4 and tail in curr:
+        curr = curr.replace(tail, "", 1).strip()
+    return curr
+
+
+def _avoid_repeat_rule(last_npc: str) -> str:
+    tail = _last_sentence(last_npc)
+    if not tail:
+        return ""
+    return f"避免复述上一条NPC内容或末句（尤其问句）。上一条末句：{tail}"
+
+
+def _sanitize_npc_reply(prev: str, curr: str, world: Dict[str, Any]) -> str:
+    if not curr:
+        return curr
+    result = curr.strip()
+    if prev:
+        result = _strip_repeated_tail(prev, result)
+        result = _dedupe_phrases(result)
+        if _is_repetitive(prev, result):
+            sentences = _split_sentences(result)
+            if len(sentences) > 1:
+                base = " ".join(sentences[:-1]).strip()
+            else:
+                base = ""
+            extra = _append_progress_hint(world)
+            result = f"{base} {extra}".strip() if base else extra
+    return result or curr
+
+
+def _is_repetitive(prev: str, curr: str) -> bool:
+    a = _norm_text(prev)
+    b = _norm_text(curr)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    # simple overlap ratio
+    set_a = set(a)
+    set_b = set(b)
+    overlap = len(set_a & set_b) / max(1, len(set_a | set_b))
+    return overlap >= 0.7
+
+
+def _append_progress_hint(world: Dict[str, Any]) -> str:
+    hooks = []
+    if isinstance(world, dict):
+        event_schema = world.get("event_schema") or {}
+        hooks = event_schema.get("plot_hooks") or []
+    if hooks:
+        return f"顺带一提，我听说{hooks[0]}。要不要去看看？"
+    return "要不我们换个方向：去问问镇上的老人，或者去钟楼看看？"
+
+
+def _infer_desire_score(
+    session,
+    chat_id: str,
+    text: str,
+    emotion_label: str,
+    base: int = 6,
+) -> float:
+    score = float(base)
+    length = len(text or "")
+    if length >= 120:
+        score += 0.8
+    elif length >= 60:
+        score += 0.4
+    elif length <= 8:
+        score -= 0.4
+
+    if "?" in text or "？" in text:
+        score += 0.3
+
+    if emotion_label in {"joy", "surprise"}:
+        score += 0.6
+    elif emotion_label in {"sad"}:
+        score -= 0.4
+    elif emotion_label in {"anger", "fear"}:
+        score -= 0.2
+
+    now = datetime.now(timezone.utc)
+    last = session.exec(
+        select(Message).where(Message.chat_id == chat_id).order_by(Message.created_at.desc()).limit(1)
+    ).first()
+    if last and last.created_at:
+        last_time = last.created_at
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        delta = (now - last_time).total_seconds()
+        if delta <= 20:
+            score += 0.5
+        elif delta >= 120:
+            score -= 0.5
+
+    recent = session.exec(
+        select(Message)
+        .where(Message.chat_id == chat_id)
+        .order_by(Message.created_at.desc())
+        .limit(6)
+    ).all()
+    if recent:
+        last_time = recent[-1].created_at
+        if last_time:
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+            span = (now - last_time).total_seconds()
+            if span <= 300:
+                score += 0.4
+            elif span >= 900:
+                score -= 0.4
+
+    return score
+
+
+def _final_desire_score(
+    session,
+    chat_id: str,
+    text: str,
+    emotion_label: str,
+    explicit: int | None,
+) -> int:
+    explicit_score = clamp_int(explicit if explicit is not None else 6, 1, 10)
+    inferred = _infer_desire_score(session, chat_id, text, emotion_label, base=6)
+    blended = explicit_score * 0.6 + inferred * 0.4
+    return clamp_int(int(round(blended)), 1, 10)
+
+
 @app.post("/chats/{chat_id}/message")
 def chat_message(chat_id: str, payload: MessageCreate) -> Dict[str, Any]:
     with get_session() as session:
         chat = session.get(Chat, chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="chat not found")
-        config = get_memory_config(session, chat_id)
+        config = get_memory_config(session, chat_id, payload.role)
         last = session.exec(
             select(Message)
             .where(Message.chat_id == chat_id)
@@ -351,8 +641,7 @@ def chat_message(chat_id: str, payload: MessageCreate) -> Dict[str, Any]:
         ).first()
         turn_index = _next_turn_index(last, payload.role)
         emotion = _emotion_for_text(payload.content)
-        desire = payload.desire_score if payload.desire_score is not None else 6
-        desire = clamp_int(desire, 1, 10)
+        desire = _final_desire_score(session, chat_id, payload.content, emotion["label"], payload.desire_score)
         topic_tag = _topic_for_text(payload.content)
         message = Message(
             id=new_id(),
@@ -369,6 +658,7 @@ def chat_message(chat_id: str, payload: MessageCreate) -> Dict[str, Any]:
         session.add(message)
         update_memory(session, chat_id, payload.role, config["add_mode"])
         session.commit()
+        _invalidate_chat_cache(chat_id)
         return {
             "id": message.id,
             "emotion_label": message.emotion_label,
@@ -376,6 +666,119 @@ def chat_message(chat_id: str, payload: MessageCreate) -> Dict[str, Any]:
             "emotion_method": message.emotion_method,
             "topic_tag": message.topic_tag,
         }
+
+
+@app.post("/chats/{chat_id}/message/stream")
+def chat_message_stream(chat_id: str, payload: MessageCreate) -> StreamingResponse:
+    def sse(data: Dict[str, Any]) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        with get_session() as session:
+            chat = session.get(Chat, chat_id)
+            if not chat:
+                yield sse({"type": "error", "message": "chat not found"})
+                return
+            world = session.get(WorldModel, chat.world_id)
+            if not world:
+                yield sse({"type": "error", "message": "world not found"})
+                return
+            config = get_memory_config(session, chat_id, payload.role)
+            last = session.exec(
+                select(Message)
+                .where(Message.chat_id == chat_id)
+                .order_by(Message.turn_index.desc())
+                .limit(1)
+            ).first()
+            user_turn = _next_turn_index(last, payload.role)
+            emotion = _emotion_for_text(payload.content)
+            desire = _final_desire_score(session, chat_id, payload.content, emotion["label"], payload.desire_score)
+            topic_tag = _topic_for_text(payload.content)
+            user_message = Message(
+                id=new_id(),
+                chat_id=chat_id,
+                role=payload.role,
+                content=payload.content,
+                emotion_label=emotion["label"],
+                emotion_confidence=emotion["confidence"],
+                emotion_method=emotion["method"],
+                desire_score=desire,
+                topic_tag=topic_tag,
+                turn_index=user_turn,
+            )
+            session.add(user_message)
+            update_memory(session, chat_id, payload.role, config["add_mode"])
+            session.commit()
+            _invalidate_chat_cache(chat_id)
+
+            world_snapshot = _world_snapshot_cached(world)
+            npc_profile = _actor_profile(session, chat_id, "npc")
+            history = _history_cached(session, chat_id, "npc", config["search_mode"])
+            last_npc = next((m["content"] for m in reversed(history) if m.get("role") == "npc"), "")
+            avoid_rule = _avoid_repeat_rule(last_npc)
+
+            if npc_profile.get("mode") == "volcengine":
+                system_prompt = _volc_sp_from_profile(world_snapshot, npc_profile)
+                if avoid_rule:
+                    system_prompt = f"{system_prompt}\n{avoid_rule}"
+                stream = generate_npc_reply_stream_with_sp(system_prompt, dumps_json(history))
+            else:
+                context = _build_context(world_snapshot, history, npc_profile)
+                if avoid_rule:
+                    context = f"{context}\n{avoid_rule}"
+                stream = generate_npc_reply_stream(context)
+
+            chunks: List[str] = []
+            for delta in stream:
+                if not delta:
+                    continue
+                chunks.append(delta)
+                yield sse({"type": "delta", "content": delta})
+
+            npc_text_raw = "".join(chunks).strip() or "(NPC) 我们继续吧。"
+            npc_text = _sanitize_npc_reply(last_npc, npc_text_raw, world_snapshot)
+            if npc_text != npc_text_raw and npc_text.startswith(npc_text_raw):
+                extra = npc_text[len(npc_text_raw):].strip()
+                if extra:
+                    yield sse({"type": "delta", "content": " " + extra})
+            npc_emotion = _emotion_for_text(npc_text)
+            npc_topic = _topic_for_text(npc_text)
+            npc_turn = _next_turn_index(user_message, "npc")
+            npc_message = Message(
+                id=new_id(),
+                chat_id=chat_id,
+                role="npc",
+                content=npc_text,
+                emotion_label=npc_emotion["label"],
+                emotion_confidence=npc_emotion["confidence"],
+                emotion_method=npc_emotion["method"],
+                desire_score=None,
+                topic_tag=npc_topic,
+                turn_index=npc_turn,
+            )
+            session.add(npc_message)
+            update_memory(session, chat_id, "npc", config["add_mode"])
+            session.commit()
+            _invalidate_chat_cache(chat_id)
+            yield sse(
+                {
+                    "type": "done",
+                    "message": {
+                        "id": npc_message.id,
+                        "role": npc_message.role,
+                        "content": npc_message.content,
+                        "emotion_label": npc_message.emotion_label,
+                        "emotion_confidence": npc_message.emotion_confidence,
+                        "emotion_method": npc_message.emotion_method,
+                        "desire_score": npc_message.desire_score,
+                        "topic_tag": npc_message.topic_tag,
+                        "turn_index": npc_message.turn_index,
+                        "created_at": npc_message.created_at.isoformat(),
+                    },
+                }
+            )
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/chats/{chat_id}/auto/one")
@@ -393,10 +796,25 @@ def auto_until(chat_id: str, payload: AutoChatRequest) -> Dict[str, Any]:
     return _auto_chat(chat_id, mode="until", max_steps=payload.max_steps, desire_stop=payload.desire_stop)
 
 
+@app.post("/chats/{chat_id}/auto/one/stream")
+def auto_one_stream(chat_id: str) -> StreamingResponse:
+    return _auto_chat_stream(chat_id, mode="one", max_steps=1, desire_stop=4)
+
+
+@app.post("/chats/{chat_id}/auto/step/stream")
+def auto_step_stream(chat_id: str, payload: AutoChatRequest) -> StreamingResponse:
+    return _auto_chat_stream(chat_id, mode="step", max_steps=payload.max_steps, desire_stop=payload.desire_stop)
+
+
+@app.post("/chats/{chat_id}/auto/until/stream")
+def auto_until_stream(chat_id: str, payload: AutoChatRequest) -> StreamingResponse:
+    return _auto_chat_stream(chat_id, mode="until", max_steps=payload.max_steps, desire_stop=payload.desire_stop)
+
+
 @app.get("/chats/{chat_id}/stats", response_model=StatsResponse)
 def chat_stats(chat_id: str) -> Dict[str, Any]:
     with get_session() as session:
-        return compute_stats(session, chat_id)
+        return _stats_cached(session, chat_id)
 
 
 @app.get("/chats/{chat_id}/memory/config", response_model=MemoryConfigResponse)
@@ -405,14 +823,45 @@ def memory_config_get(chat_id: str) -> Dict[str, Any]:
         chat = session.get(Chat, chat_id)
         if not chat:
             raise HTTPException(status_code=404, detail="chat not found")
-        config = get_memory_config(session, chat_id)
+        config = get_memory_config(session, chat_id, "npc")
         return {
             "chat_id": chat_id,
             "add_mode": config["add_mode"],
             "search_mode": config["search_mode"],
-            "supported_add_modes": supported_add_modes(),
-            "supported_search_modes": supported_search_modes(),
+            "supported_add_modes": supported_add_modes("npc"),
+            "supported_search_modes": supported_search_modes("npc"),
         }
+
+
+@app.get("/chats/{chat_id}/memory/config/user", response_model=MemoryConfigResponse)
+def memory_config_get_user(chat_id: str) -> Dict[str, Any]:
+    with get_session() as session:
+        chat = session.get(Chat, chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="chat not found")
+        config = get_memory_config(session, chat_id, "user")
+        return {
+            "chat_id": chat_id,
+            "add_mode": config["add_mode"],
+            "search_mode": config["search_mode"],
+            "supported_add_modes": supported_add_modes("user"),
+            "supported_search_modes": supported_search_modes("user"),
+        }
+
+
+@app.get("/chats/{chat_id}/memory/{role}")
+def memory_state_get(chat_id: str, role: str) -> Dict[str, Any]:
+    role = role.lower()
+    if role not in ("npc", "user"):
+        raise HTTPException(status_code=400, detail="role must be npc or user")
+    with get_session() as session:
+        chat = session.get(Chat, chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="chat not found")
+        items = get_memory(session, chat_id, role)
+        state = session.get(MemoryState, f"{chat_id}:{role}")
+        mode = state.mode if state else DEFAULT_ADD_MODE
+        return {"role": role, "mode": mode, "items": items}
 
 
 @app.put("/chats/{chat_id}/memory/config", response_model=MemoryConfigResponse)
@@ -423,20 +872,43 @@ def memory_config_update(chat_id: str, payload: MemoryConfigUpdate) -> Dict[str,
             raise HTTPException(status_code=404, detail="chat not found")
         add_mode = payload.add_mode
         search_mode = payload.search_mode
-        if add_mode and add_mode not in supported_add_modes():
+        if add_mode and add_mode not in supported_add_modes("npc"):
             raise HTTPException(status_code=400, detail="unsupported add_mode")
-        if search_mode and search_mode not in supported_search_modes():
+        if search_mode and search_mode not in supported_search_modes("npc"):
             raise HTTPException(status_code=400, detail="unsupported search_mode")
-        config = set_memory_config(session, chat_id, add_mode, search_mode)
+        config = set_memory_config(session, chat_id, add_mode, search_mode, "npc")
         update_memory(session, chat_id, "npc", config["add_mode"])
+        session.commit()
+        return {
+            "chat_id": chat_id,
+            "add_mode": config["add_mode"],
+            "search_mode": config["search_mode"],
+            "supported_add_modes": supported_add_modes("npc"),
+            "supported_search_modes": supported_search_modes("npc"),
+        }
+
+
+@app.put("/chats/{chat_id}/memory/config/user", response_model=MemoryConfigResponse)
+def memory_config_update_user(chat_id: str, payload: MemoryConfigUpdate) -> Dict[str, Any]:
+    with get_session() as session:
+        chat = session.get(Chat, chat_id)
+        if not chat:
+            raise HTTPException(status_code=404, detail="chat not found")
+        add_mode = payload.add_mode
+        search_mode = payload.search_mode
+        if add_mode and add_mode not in supported_add_modes("user"):
+            raise HTTPException(status_code=400, detail="unsupported add_mode")
+        if search_mode and search_mode not in supported_search_modes("user"):
+            raise HTTPException(status_code=400, detail="unsupported search_mode")
+        config = set_memory_config(session, chat_id, add_mode, search_mode, "user")
         update_memory(session, chat_id, "user", config["add_mode"])
         session.commit()
         return {
             "chat_id": chat_id,
             "add_mode": config["add_mode"],
             "search_mode": config["search_mode"],
-            "supported_add_modes": supported_add_modes(),
-            "supported_search_modes": supported_search_modes(),
+            "supported_add_modes": supported_add_modes("user"),
+            "supported_search_modes": supported_search_modes("user"),
         }
 
 
@@ -500,7 +972,7 @@ def chat_export(chat_id: str) -> Dict[str, Any]:
         if not chat:
             raise HTTPException(status_code=404, detail="chat not found")
         world = session.get(WorldModel, chat.world_id)
-        world_snapshot = loads_json(world.snapshot_json, {}) if world else {}
+        world_snapshot = _world_snapshot_cached(world) if world else {}
         world_events = session.exec(
             select(WorldEvent).where(WorldEvent.world_id == chat.world_id).order_by(WorldEvent.version)
         ).all()
@@ -581,7 +1053,7 @@ def chat_export(chat_id: str) -> Dict[str, Any]:
                 "session_time": session_config.session_time if session_config else None,
                 "updated_at": session_config.updated_at.isoformat() if session_config else None,
             },
-            "stats": compute_stats(session, chat_id),
+            "stats": _stats_cached(session, chat_id),
         }
 
 
@@ -596,6 +1068,20 @@ def actor_update(actor_id: str, payload: ActorUpdate) -> Dict[str, Any]:
         session.commit()
         session.refresh(profile)
         return {"id": profile.id}
+
+
+@app.get("/actor/{actor_id}")
+def actor_get(actor_id: str) -> Dict[str, Any]:
+    with get_session() as session:
+        profile = session.get(ActorProfile, actor_id)
+        if not profile:
+            raise HTTPException(status_code=404, detail="actor not found")
+        return {
+            "id": profile.id,
+            "role": profile.role,
+            "profile": loads_json(profile.profile_json, {}),
+            "updated_at": profile.updated_at.isoformat(),
+        }
 
 
 @app.post("/actor")
@@ -621,11 +1107,12 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
         world = session.get(WorldModel, chat.world_id)
         if not world:
             raise HTTPException(status_code=404, detail="world not found")
-        config = get_memory_config(session, chat_id)
-        world_snapshot = loads_json(world.snapshot_json, {})
+        config = get_memory_config(session, chat_id, "npc")
+        user_config = get_memory_config(session, chat_id, "user")
+        world_snapshot = _world_snapshot_cached(world)
         npc_profile = _actor_profile(session, chat_id, "npc")
         user_profile = _actor_profile(session, chat_id, "user")
-        history = _recent_history(session, chat_id, "npc", config["search_mode"])
+        history = _history_cached(session, chat_id, "npc", config["search_mode"])
         last = session.exec(
             select(Message)
             .where(Message.chat_id == chat_id)
@@ -636,12 +1123,52 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
         created = []
         steps = 0
         while steps < max_steps:
+            pre_user_desire: float | None = None
+            if last_msg and last_msg.role == "npc":
+                user_context = _build_user_context(_recent_context(session, chat_id), user_profile)
+                user_data = generate_user_reply(user_context)
+                user_text = user_data.get("content", "")
+                try:
+                    desire_value = int(user_data.get("desire_score", 6))
+                except Exception:
+                    desire_value = 6
+                emotion = _emotion_for_text(user_text)
+                pre_user_desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
+                topic_tag = _topic_for_text(user_text)
+                user_turn = _next_turn_index(last_msg, "user")
+                user_msg = Message(
+                    id=new_id(),
+                    chat_id=chat_id,
+                    role="user",
+                    content=user_text,
+                    emotion_label=emotion["label"],
+                    emotion_confidence=emotion["confidence"],
+                    emotion_method=emotion["method"],
+                    desire_score=pre_user_desire,
+                    topic_tag=topic_tag,
+                    turn_index=user_turn,
+                )
+                session.add(user_msg)
+                update_memory(session, chat_id, "user", user_config["add_mode"])
+                session.commit()
+                _invalidate_chat_cache(chat_id)
+                created.append(user_msg)
+                last_msg = user_msg
+                history.append({"role": "user", "content": user_text})
+
+            last_npc = next((m["content"] for m in reversed(history) if m.get("role") == "npc"), "")
+            avoid_rule = _avoid_repeat_rule(last_npc)
             if npc_profile.get("mode") == "volcengine":
                 system_prompt = _volc_sp_from_profile(world_snapshot, npc_profile)
+                if avoid_rule:
+                    system_prompt = f"{system_prompt}\n{avoid_rule}"
                 npc_text = generate_npc_reply_with_sp(system_prompt, dumps_json(history))
             else:
                 context = _build_context(world_snapshot, history, npc_profile)
+                if avoid_rule:
+                    context = f"{context}\n{avoid_rule}"
                 npc_text = generate_npc_reply(context)
+            npc_text = _sanitize_npc_reply(last_npc, npc_text, world_snapshot)
             emotion = _emotion_for_text(npc_text)
             topic_tag = _topic_for_text(npc_text)
             npc_turn = _next_turn_index(last_msg, "npc")
@@ -660,19 +1187,25 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
             session.add(npc_msg)
             update_memory(session, chat_id, "npc", config["add_mode"])
             session.commit()
+            _invalidate_chat_cache(chat_id)
             created.append(npc_msg)
             if mode == "one":
                 break
             last_msg = npc_msg
             history.append({"role": "npc", "content": npc_text})
-            user_context = _build_context(world_snapshot, history, user_profile)
+            if pre_user_desire is not None:
+                if mode == "until" and pre_user_desire < desire_stop:
+                    break
+                steps += 1
+                continue
+            user_context = _build_user_context(_recent_context(session, chat_id), user_profile)
             user_data = generate_user_reply(user_context)
             user_text = user_data.get("content", "")
             try:
                 desire_value = int(user_data.get("desire_score", 6))
             except Exception:
                 desire_value = 6
-            desire = clamp_int(desire_value, 1, 10)
+            desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
             emotion = _emotion_for_text(user_text)
             topic_tag = _topic_for_text(user_text)
             user_turn = _next_turn_index(last_msg, "user")
@@ -689,8 +1222,9 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
                 turn_index=user_turn,
             )
             session.add(user_msg)
-            update_memory(session, chat_id, "user", config["add_mode"])
+            update_memory(session, chat_id, "user", user_config["add_mode"])
             session.commit()
+            _invalidate_chat_cache(chat_id)
             created.append(user_msg)
             history.append({"role": "user", "content": user_text})
             if mode == "until" and desire < desire_stop:
@@ -713,3 +1247,211 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
                 for m in created
             ]
         }
+
+
+def _auto_chat_stream(chat_id: str, mode: str, max_steps: int, desire_stop: int = 4) -> StreamingResponse:
+    def sse(data: Dict[str, Any]) -> str:
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def event_stream():
+        with get_session() as session:
+            chat = session.get(Chat, chat_id)
+            if not chat:
+                yield sse({"type": "error", "message": "chat not found"})
+                return
+            world = session.get(WorldModel, chat.world_id)
+            if not world:
+                yield sse({"type": "error", "message": "world not found"})
+                return
+            config = get_memory_config(session, chat_id, "npc")
+            user_config = get_memory_config(session, chat_id, "user")
+            world_snapshot = _world_snapshot_cached(world)
+            npc_profile = _actor_profile(session, chat_id, "npc")
+            user_profile = _actor_profile(session, chat_id, "user")
+            history = _history_cached(session, chat_id, "npc", config["search_mode"])
+            last = session.exec(
+                select(Message)
+                .where(Message.chat_id == chat_id)
+                .order_by(Message.turn_index.desc())
+                .limit(1)
+            ).first()
+            last_msg = last
+            steps = 0
+
+            while steps < max_steps:
+                pre_user_desire: float | None = None
+                if last_msg and last_msg.role == "npc":
+                    user_context = _build_user_context(_recent_context(session, chat_id), user_profile)
+                    user_data = generate_user_reply(user_context)
+                    user_text = user_data.get("content", "")
+                    try:
+                        desire_value = int(user_data.get("desire_score", 6))
+                    except Exception:
+                        desire_value = 6
+                    emotion = _emotion_for_text(user_text)
+                    pre_user_desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
+                    topic_tag = _topic_for_text(user_text)
+                    user_turn = _next_turn_index(last_msg, "user")
+                    user_msg = Message(
+                        id=new_id(),
+                        chat_id=chat_id,
+                        role="user",
+                        content=user_text,
+                        emotion_label=emotion["label"],
+                        emotion_confidence=emotion["confidence"],
+                        emotion_method=emotion["method"],
+                        desire_score=pre_user_desire,
+                        topic_tag=topic_tag,
+                        turn_index=user_turn,
+                    )
+                    session.add(user_msg)
+                    update_memory(session, chat_id, "user", user_config["add_mode"])
+                    session.commit()
+                    _invalidate_chat_cache(chat_id)
+                    yield sse(
+                        {
+                            "type": "user_done",
+                            "message": {
+                                "id": user_msg.id,
+                                "role": user_msg.role,
+                                "content": user_msg.content,
+                                "emotion_label": user_msg.emotion_label,
+                                "emotion_confidence": user_msg.emotion_confidence,
+                                "emotion_method": user_msg.emotion_method,
+                                "desire_score": user_msg.desire_score,
+                                "topic_tag": user_msg.topic_tag,
+                                "turn_index": user_msg.turn_index,
+                                "created_at": user_msg.created_at.isoformat(),
+                            },
+                        }
+                    )
+                    last_msg = user_msg
+                    history.append({"role": "user", "content": user_text})
+
+                last_npc = next((m["content"] for m in reversed(history) if m.get("role") == "npc"), "")
+                avoid_rule = _avoid_repeat_rule(last_npc)
+                if npc_profile.get("mode") == "volcengine":
+                    system_prompt = _volc_sp_from_profile(world_snapshot, npc_profile)
+                    if avoid_rule:
+                        system_prompt = f"{system_prompt}\n{avoid_rule}"
+                    stream = generate_npc_reply_stream_with_sp(system_prompt, dumps_json(history))
+                else:
+                    context = _build_context(world_snapshot, history, npc_profile)
+                    if avoid_rule:
+                        context = f"{context}\n{avoid_rule}"
+                    stream = generate_npc_reply_stream(context)
+
+                chunks: List[str] = []
+                for delta in stream:
+                    if not delta:
+                        continue
+                    chunks.append(delta)
+                    yield sse({"type": "npc_delta", "content": delta})
+
+                npc_text_raw = "".join(chunks).strip() or "(NPC) 我们继续吧。"
+                npc_text = _sanitize_npc_reply(last_npc, npc_text_raw, world_snapshot)
+                if npc_text != npc_text_raw and npc_text.startswith(npc_text_raw):
+                    extra = npc_text[len(npc_text_raw):].strip()
+                    if extra:
+                        yield sse({"type": "npc_delta", "content": " " + extra})
+
+                emotion = _emotion_for_text(npc_text)
+                topic_tag = _topic_for_text(npc_text)
+                npc_turn = _next_turn_index(last_msg, "npc")
+                npc_msg = Message(
+                    id=new_id(),
+                    chat_id=chat_id,
+                    role="npc",
+                    content=npc_text,
+                    emotion_label=emotion["label"],
+                    emotion_confidence=emotion["confidence"],
+                    emotion_method=emotion["method"],
+                    desire_score=None,
+                    topic_tag=topic_tag,
+                    turn_index=npc_turn,
+                )
+                session.add(npc_msg)
+                update_memory(session, chat_id, "npc", config["add_mode"])
+                session.commit()
+                _invalidate_chat_cache(chat_id)
+                yield sse(
+                    {
+                        "type": "npc_done",
+                        "message": {
+                            "id": npc_msg.id,
+                            "role": npc_msg.role,
+                            "content": npc_msg.content,
+                            "emotion_label": npc_msg.emotion_label,
+                            "emotion_confidence": npc_msg.emotion_confidence,
+                            "emotion_method": npc_msg.emotion_method,
+                            "desire_score": npc_msg.desire_score,
+                            "topic_tag": npc_msg.topic_tag,
+                            "turn_index": npc_msg.turn_index,
+                            "created_at": npc_msg.created_at.isoformat(),
+                        },
+                    }
+                )
+
+                if mode == "one":
+                    break
+
+                last_msg = npc_msg
+                history.append({"role": "npc", "content": npc_text})
+                if pre_user_desire is not None:
+                    if mode == "until" and pre_user_desire < desire_stop:
+                        break
+                    steps += 1
+                    continue
+                user_context = _build_user_context(_recent_context(session, chat_id), user_profile)
+                user_data = generate_user_reply(user_context)
+                user_text = user_data.get("content", "")
+                try:
+                    desire_value = int(user_data.get("desire_score", 6))
+                except Exception:
+                    desire_value = 6
+                emotion = _emotion_for_text(user_text)
+                desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
+                topic_tag = _topic_for_text(user_text)
+                user_turn = _next_turn_index(last_msg, "user")
+                user_msg = Message(
+                    id=new_id(),
+                    chat_id=chat_id,
+                    role="user",
+                    content=user_text,
+                    emotion_label=emotion["label"],
+                    emotion_confidence=emotion["confidence"],
+                    emotion_method=emotion["method"],
+                    desire_score=desire,
+                    topic_tag=topic_tag,
+                    turn_index=user_turn,
+                )
+                session.add(user_msg)
+                update_memory(session, chat_id, "user", user_config["add_mode"])
+                session.commit()
+                _invalidate_chat_cache(chat_id)
+                yield sse(
+                    {
+                        "type": "user_done",
+                        "message": {
+                            "id": user_msg.id,
+                            "role": user_msg.role,
+                            "content": user_msg.content,
+                            "emotion_label": user_msg.emotion_label,
+                            "emotion_confidence": user_msg.emotion_confidence,
+                            "emotion_method": user_msg.emotion_method,
+                            "desire_score": user_msg.desire_score,
+                            "topic_tag": user_msg.topic_tag,
+                            "turn_index": user_msg.turn_index,
+                            "created_at": user_msg.created_at.isoformat(),
+                        },
+                    }
+                )
+                history.append({"role": "user", "content": user_text})
+                if mode == "until" and desire < desire_stop:
+                    break
+                last_msg = user_msg
+                steps += 1
+
+            yield sse({"type": "done"})
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

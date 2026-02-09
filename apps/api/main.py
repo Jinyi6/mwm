@@ -375,10 +375,11 @@ def _volc_sp_from_profile(world: Dict[str, Any], npc_profile: Dict[str, Any]) ->
     golden_sp = npc_profile.get("golden_sp", "")
     defaults = [
         "你使用口语进行表达，必要时可用括号描述动作和情绪。",
-        "你需要尽可能引导用户跟你进行交流，你不应该表现地太AI。",
-        "每次回复推进剧情，提出问题或下一步行动，抛出具体线索或选择。",
+        "你需要在自然聊天中引导用户交流，你不应该表现地太AI。",
+        "你要主动推进剧情，但不要求每轮提问；可用陈述句自然带出线索。",
+        "每2-3轮至少推进一个plot_hooks，用户犹豫时给出下一步行动建议。",
         "避免重复上一轮NPC内容或问句；若用户已回应，请确认并给出新进展。",
-        "避免使用“你怎么想/你怎么看/你觉得呢”等泛问句，改用具体行动或选择。",
+        "避免连续使用泛问句，优先自然表达与具体细节。",
         "仅使用中文回答。",
     ]
     if not golden_sp:
@@ -549,8 +550,8 @@ def _append_progress_hint(world: Dict[str, Any]) -> str:
         event_schema = world.get("event_schema") or {}
         hooks = event_schema.get("plot_hooks") or []
     if hooks:
-        return f"顺带一提，我听说{hooks[0]}。要不要去看看？"
-    return "要不我们换个方向：去问问镇上的老人，或者去钟楼看看？"
+        return f"顺带一提，我听说{hooks[0]}。我们先过去看看，路上我再和你说细节。"
+    return "我们换个方向吧，先去问问镇上的老人，再顺路去钟楼看看。"
 
 
 def _infer_desire_score(
@@ -710,6 +711,23 @@ def chat_message_stream(chat_id: str, payload: MessageCreate) -> StreamingRespon
             update_memory(session, chat_id, payload.role, config["add_mode"])
             session.commit()
             _invalidate_chat_cache(chat_id)
+            yield sse(
+                {
+                    "type": "user_done",
+                    "message": {
+                        "id": user_message.id,
+                        "role": user_message.role,
+                        "content": user_message.content,
+                        "emotion_label": user_message.emotion_label,
+                        "emotion_confidence": user_message.emotion_confidence,
+                        "emotion_method": user_message.emotion_method,
+                        "desire_score": user_message.desire_score,
+                        "topic_tag": user_message.topic_tag,
+                        "turn_index": user_message.turn_index,
+                        "created_at": user_message.created_at.isoformat(),
+                    },
+                }
+            )
 
             world_snapshot = _world_snapshot_cached(world)
             npc_profile = _actor_profile(session, chat_id, "npc")
@@ -1205,8 +1223,8 @@ def _auto_chat(chat_id: str, mode: str, max_steps: int, desire_stop: int = 5) ->
                 desire_value = int(user_data.get("desire_score", 6))
             except Exception:
                 desire_value = 6
-            desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
             emotion = _emotion_for_text(user_text)
+            desire = _final_desire_score(session, chat_id, user_text, emotion["label"], desire_value)
             topic_tag = _topic_for_text(user_text)
             user_turn = _next_turn_index(last_msg, "user")
             user_msg = Message(

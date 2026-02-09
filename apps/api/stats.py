@@ -154,6 +154,20 @@ def _trend_summary(desires: List[int], window: int = 6) -> Dict[str, object]:
     }
 
 
+def _emotion_distribution(items: List[Message], role: str | None = None) -> Dict[str, int]:
+    distribution = {label: 0 for label in EMOTION_LABELS}
+    for m in items:
+        if role and m.role != role:
+            continue
+        if not m.emotion_label:
+            continue
+        if m.emotion_label in distribution:
+            distribution[m.emotion_label] += 1
+        else:
+            distribution["other"] += 1
+    return distribution
+
+
 def compute_stats(session: Session, chat_id: str) -> Dict[str, any]:
     stmt = (
         select(Message)
@@ -165,14 +179,12 @@ def compute_stats(session: Session, chat_id: str) -> Dict[str, any]:
     turns = len(set([m.turn_index for m in items])) if items else 0
     desires = [m.desire_score for m in items if m.desire_score is not None]
     avg_desire = sum(desires) / len(desires) if desires else 0.0
-    emotion_distribution = {label: 0 for label in EMOTION_LABELS}
-    for m in items:
-        if not m.emotion_label:
-            continue
-        if m.emotion_label in emotion_distribution:
-            emotion_distribution[m.emotion_label] += 1
-        else:
-            emotion_distribution["other"] += 1
+    emotion_all = _emotion_distribution(items)
+    emotion_user = _emotion_distribution(items, role="user")
+    emotion_npc = _emotion_distribution(items, role="npc")
+    # Keep backward-compatible field but fix semantics:
+    # emotion_distribution defaults to user side (aligned with desire metrics).
+    emotion_distribution = emotion_user if sum(emotion_user.values()) > 0 else emotion_all
     texts = [m.content for m in items]
     topics = [m.topic_tag or "" for m in items]
     avg_turn_duration = _avg_turn_duration(items)
@@ -186,6 +198,9 @@ def compute_stats(session: Session, chat_id: str) -> Dict[str, any]:
         "total_turns": turns,
         "avg_desire": round(avg_desire, 2),
         "emotion_distribution": emotion_distribution,
+        "emotion_distribution_all": emotion_all,
+        "emotion_distribution_user": emotion_user,
+        "emotion_distribution_npc": emotion_npc,
         "lexical_diversity": lexical_diversity(texts),
         "topic_diversity": topic_diversity(topics),
         "desire_series": desires,

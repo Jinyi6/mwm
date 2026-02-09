@@ -53,6 +53,9 @@ class StatsResponse(BaseModel):
     total_turns: int
     avg_desire: float
     emotion_distribution: Dict[str, int]
+    emotion_distribution_all: Dict[str, int]
+    emotion_distribution_user: Dict[str, int]
+    emotion_distribution_npc: Dict[str, int]
     lexical_diversity: Dict[str, float]
     topic_diversity: Dict[str, float]
     desire_series: List[int]

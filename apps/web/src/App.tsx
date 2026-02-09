@@ -31,6 +31,9 @@ type Stats = {
   total_turns: number
   avg_desire: number
   emotion_distribution: Record<string, number>
+  emotion_distribution_all?: Record<string, number>
+  emotion_distribution_user?: Record<string, number>
+  emotion_distribution_npc?: Record<string, number>
   lexical_diversity: { ttr: number; mtld: number }
   topic_diversity: { unique: number; entropy: number }
   desire_series: number[]
@@ -332,11 +335,18 @@ function ChartLineAny({ values, max }: { values: number[]; max?: number }) {
 }
 
 function ChartBars({ data }: { data: Record<string, number> }) {
-  const entries = Object.entries(data || {})
+  const entries = Object.entries(data || {}).filter(([, val]) => Number(val) > 0)
   if (entries.length === 0) {
     return <div className="chart-empty">暂无情绪数据</div>
   }
-  const chartData = entries.map(([key, val]) => ({ label: key, value: val }))
+  const total = entries.reduce((sum, [, val]) => sum + Number(val), 0)
+  const chartData = entries
+    .map(([key, val]) => ({
+      label: key,
+      value: Number(val),
+      ratio: total > 0 ? Number(val) / total : 0,
+    }))
+    .sort((a, b) => b.value - a.value)
   return (
     <Suspense fallback={<div className="chart-empty">图表加载中...</div>}>
       <LazyBar
@@ -346,8 +356,13 @@ function ChartBars({ data }: { data: Record<string, number> }) {
         autoFit
         height={200}
         color="var(--primary)"
+        label={{
+          text: (datum: any) => `${Math.round((datum.ratio || 0) * 100)}%`,
+          style: { fill: 'var(--muted)', fontSize: 11 },
+        }}
         xAxis={{ tickCount: 5 }}
         yAxis={{ label: { style: { fill: 'var(--muted)' } } }}
+        legend={false}
         interactions={[{ type: 'element-active' }]}
         animation={{ appear: { animation: 'scale-in-x', duration: 600 } }}
       />
@@ -373,6 +388,52 @@ type StreamHandlers = {
   onUserDone?: (msg: Message) => void
 }
 
+type EmotionScope = 'user' | 'npc' | 'all'
+
+const NPC_PROFILE_IGNORE_KEYS = new Set([
+  'role',
+  'mode',
+  'role_name',
+  'user_name',
+  'init_role_sp',
+  'user_info',
+  'golden_sp',
+  'notes',
+  'chat_id',
+])
+
+const USER_PROFILE_IGNORE_KEYS = new Set([
+  'role',
+  'display_name',
+  'background',
+  'persona',
+  'goals',
+  'constraints',
+  'notes',
+  'chat_id',
+])
+
+function sortMessagesChronologically(items: Message[]): Message[] {
+  return [...items].sort((a, b) => {
+    const ta = a.created_at ? new Date(a.created_at).getTime() : 0
+    const tb = b.created_at ? new Date(b.created_at).getTime() : 0
+    if (ta && tb && ta !== tb) return ta - tb
+    return a.turn_index - b.turn_index
+  })
+}
+
+function nextTurnForRole(items: Message[], role: string): number {
+  if (!items.length) return 1
+  const sorted = sortMessagesChronologically(items)
+  const last = sorted[sorted.length - 1]
+  if (last.role !== role) return last.turn_index
+  return last.turn_index + 1
+}
+
+function stableTempId(prefix: string): string {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'town' | 'dream' | 'gothic' | 'pixel' | 'nebula'>('town')
   const [world, setWorld] = useState<World | null>(null)
@@ -388,15 +449,15 @@ export default function App() {
     memoryWorking: [],
   })
   const [npcForm, setNpcForm] = useState<NpcForm>({
-    mode: 'default',
+    mode: 'volcengine',
     roleName: '林一',
     userName: '小周',
     initRole: '简介: 你是林一，一位自由插画师。性格开朗，待人温柔体贴。',
     userInfo: '用户叫小周，是你的未婚妻，你通常称呼她为宝贝或周周。',
     goldenSp:
       '你使用口语进行表达，必要时可用括号描述动作和情绪。\n' +
-      '你需要尽可能引导用户跟你进行交流，你不应该表现地太AI。\n' +
-      '每次回复推进剧情，提出问题或下一步行动。',
+      '你在自然聊天中引导交流，不要表现得太AI。\n' +
+      '你要推进剧情，但不必每句提问，可通过细节和陈述自然带出线索。',
     notes: [],
   })
   const [npcExtras, setNpcExtras] = useState<KV[]>([])
@@ -416,6 +477,7 @@ export default function App() {
   const [inputText, setInputText] = useState('')
   const [inputDesire, setInputDesire] = useState(6)
   const [stats, setStats] = useState<Stats | null>(null)
+  const [emotionScope, setEmotionScope] = useState<EmotionScope>('user')
   const [memoryConfig, setMemoryConfig] = useState<MemoryConfig | null>(null)
   const [userMemoryConfig, setUserMemoryConfig] = useState<MemoryConfig | null>(null)
   const [sessionConfig, setSessionConfig] = useState<SessionConfig | null>(null)
@@ -431,14 +493,11 @@ export default function App() {
   const [notice, setNotice] = useState<{ title: string; body: string } | null>(null)
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const composerRef = useRef<any>(null)
+  const worldLoadReqRef = useRef(0)
+  const chatLoadReqRef = useRef(0)
 
   const messageList = useMemo(() => {
-    return [...messages].sort((a, b) => {
-      const ta = a.created_at ? new Date(a.created_at).getTime() : 0
-      const tb = b.created_at ? new Date(b.created_at).getTime() : 0
-      if (ta && tb && ta !== tb) return ta - tb
-      return a.turn_index - b.turn_index
-    })
+    return sortMessagesChronologically(messages)
   }, [messages])
 
   useEffect(() => {
@@ -461,6 +520,12 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages.length, chatId])
 
+  useEffect(() => {
+    if (!error) return
+    const timer = window.setTimeout(() => setError(''), 5200)
+    return () => window.clearTimeout(timer)
+  }, [error])
+
   const formatDuration = (seconds: number) => {
     if (!seconds || Number.isNaN(seconds)) return '0s'
     if (seconds < 60) return `${seconds.toFixed(1)}s`
@@ -476,11 +541,14 @@ export default function App() {
     return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
   }
 
-  const composerHint = !chatId
-    ? '请先创建或加载对话。'
-    : !inputText.trim()
-      ? '输入内容后回车发送，Shift+Enter 换行。'
-      : '回车发送，Shift+Enter 换行。'
+  const composerHint = !chatId ? '请先创建或加载对话。' : ''
+
+  const emotionDistribution = useMemo(() => {
+    if (!stats) return {}
+    if (emotionScope === 'user') return stats.emotion_distribution_user || stats.emotion_distribution || {}
+    if (emotionScope === 'npc') return stats.emotion_distribution_npc || {}
+    return stats.emotion_distribution_all || stats.emotion_distribution || {}
+  }, [stats, emotionScope])
 
   const readSSE = async (
     url: string,
@@ -503,16 +571,20 @@ export default function App() {
       const { value, done } = await reader.read()
       if (done) break
       buffer += decoder.decode(value, { stream: true })
-      let idx = buffer.indexOf('\n\n')
-      while (idx !== -1) {
-        const chunk = buffer.slice(0, idx)
-        buffer = buffer.slice(idx + 2)
-        const lines = chunk.split('\n')
+      const chunks = buffer.split(/\r?\n\r?\n/g)
+      buffer = chunks.pop() || ''
+      for (const chunk of chunks) {
+        const lines = chunk.split(/\r?\n/g)
         for (const line of lines) {
           if (!line.startsWith('data:')) continue
           const payload = line.slice(5).trim()
           if (!payload) continue
-          const data = JSON.parse(payload)
+          let data: any
+          try {
+            data = JSON.parse(payload)
+          } catch (err) {
+            continue
+          }
           if ((data.type === 'delta' || data.type === 'npc_delta') && data.content) {
             handlers.onDelta?.(data.content)
           }
@@ -526,7 +598,6 @@ export default function App() {
             throw new Error(data.message || 'Stream error')
           }
         }
-        idx = buffer.indexOf('\n\n')
       }
     }
   }
@@ -555,6 +626,46 @@ export default function App() {
     }
   }
 
+  const refreshChatSideData = async (id: string) => {
+    if (!id) return
+    await Promise.all([
+      refreshStats(id),
+      loadMemoryStates(id),
+      loadMemoryConfig(id),
+      loadUserMemoryConfig(id),
+      loadSessionConfig(id),
+    ])
+  }
+
+  const applyNpcProfile = (profile: Record<string, any>, actorId?: string) => {
+    if (actorId) setNpcActorId(actorId)
+    setNpcForm((prev) => ({
+      ...prev,
+      mode: profile.mode || prev.mode,
+      roleName: profile.role_name || prev.roleName,
+      userName: profile.user_name || prev.userName,
+      initRole: profile.init_role_sp || prev.initRole,
+      userInfo: profile.user_info || prev.userInfo,
+      goldenSp: profile.golden_sp || prev.goldenSp,
+      notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
+    }))
+    setNpcExtras(toKVExtras(profile, NPC_PROFILE_IGNORE_KEYS))
+  }
+
+  const applyUserProfile = (profile: Record<string, any>, actorId?: string) => {
+    if (actorId) setUserActorId(actorId)
+    setUserForm((prev) => ({
+      ...prev,
+      displayName: profile.display_name || prev.displayName,
+      background: profile.background || prev.background,
+      persona: profile.persona || prev.persona,
+      goals: profile.goals || prev.goals,
+      constraints: profile.constraints || prev.constraints,
+      notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
+    }))
+    setUserExtras(toKVExtras(profile, USER_PROFILE_IGNORE_KEYS))
+  }
+
   const loadActorById = async (role: 'npc' | 'user', id: string) => {
     if (!id.trim()) return
     try {
@@ -563,51 +674,9 @@ export default function App() {
       const data = await api<any>(`/actor/${id.trim()}`)
       const profile = data.profile || {}
       if (role === 'npc') {
-        setNpcActorId(data.id || id)
-        setNpcForm((prev) => ({
-          ...prev,
-          mode: profile.mode || prev.mode,
-          roleName: profile.role_name || prev.roleName,
-          userName: profile.user_name || prev.userName,
-          initRole: profile.init_role_sp || prev.initRole,
-          userInfo: profile.user_info || prev.userInfo,
-          goldenSp: profile.golden_sp || prev.goldenSp,
-          notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
-        }))
-        const ignore = new Set([
-          'role',
-          'mode',
-          'role_name',
-          'user_name',
-          'init_role_sp',
-          'user_info',
-          'golden_sp',
-          'notes',
-          'chat_id',
-        ])
-        setNpcExtras(toKVExtras(profile, ignore))
+        applyNpcProfile(profile, data.id || id)
       } else {
-        setUserActorId(data.id || id)
-        setUserForm((prev) => ({
-          ...prev,
-          displayName: profile.display_name || prev.displayName,
-          background: profile.background || prev.background,
-          persona: profile.persona || prev.persona,
-          goals: profile.goals || prev.goals,
-          constraints: profile.constraints || prev.constraints,
-          notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
-        }))
-        const ignore = new Set([
-          'role',
-          'display_name',
-          'background',
-          'persona',
-          'goals',
-          'constraints',
-          'notes',
-          'chat_id',
-        ])
-        setUserExtras(toKVExtras(profile, ignore))
+        applyUserProfile(profile, data.id || id)
       }
       setStatus(`${role.toUpperCase()} 设定已加载`)
     } catch (err: any) {
@@ -815,7 +884,21 @@ export default function App() {
         label: '情绪分布',
         children: stats ? (
           <div className="stats-panel">
-            <ChartBars data={stats.emotion_distribution} />
+            <div className="stat-row">
+              <span>统计对象</span>
+              <Select
+                size="small"
+                value={emotionScope}
+                onChange={(value) => setEmotionScope(value as EmotionScope)}
+                options={[
+                  { value: 'user', label: '用户' },
+                  { value: 'npc', label: 'NPC' },
+                  { value: 'all', label: '全部消息' },
+                ]}
+                style={{ width: 130 }}
+              />
+            </div>
+            <ChartBars data={emotionDistribution} />
           </div>
         ) : (
           <div className="empty">暂无数据</div>
@@ -973,105 +1056,67 @@ export default function App() {
         ),
       },
     ],
-    [stats, memoryConfig, userMemoryConfig, sessionConfig, downloadId, chatId, busy]
+    [stats, memoryConfig, userMemoryConfig, sessionConfig, downloadId, chatId, busy, emotionScope, emotionDistribution]
   )
 
   const loadWorldById = async (id: string, silent?: boolean) => {
-    if (!id.trim()) return
+    const targetId = id.trim()
+    if (!targetId) return
+    const reqId = ++worldLoadReqRef.current
     try {
       if (!silent) {
         setBusy(true)
         setStatus('加载世界中...')
       }
-      const data = await api<World>(`/worlds/${id.trim()}`)
+      const data = await api<World>(`/worlds/${targetId}`)
+      if (reqId !== worldLoadReqRef.current) return
       setWorld(data)
       setWorldForm(worldFormFromSnapshot(data.snapshot))
       if (!silent) setStatus('世界已加载')
     } catch (err: any) {
+      if (reqId !== worldLoadReqRef.current) return
       setError(err.message)
       setStatus('')
     } finally {
-      if (!silent) setBusy(false)
+      if (!silent && reqId === worldLoadReqRef.current) setBusy(false)
     }
   }
 
   const loadChatById = async (id: string) => {
+    const targetId = id.trim()
+    if (!targetId) return
+    const reqId = ++chatLoadReqRef.current
     try {
       setBusy(true)
       setStatus('加载对话中...')
-      const data = await api<any>(`/chats/${id}`)
-      setChatId(id)
-      setDownloadId(id)
-      setMessages(data.messages || [])
-      if (data.world_id) {
-        await loadWorldById(data.world_id, true)
-      }
-      try {
-        const actors = await api<any>(`/chats/${id}/actors`)
-        if (actors?.npc?.profile) {
-          const profile = actors.npc.profile
-          setNpcActorId(actors.npc.id || '')
-          setNpcForm((prev) => ({
-            ...prev,
-            mode: profile.mode || prev.mode,
-            roleName: profile.role_name || prev.roleName,
-            userName: profile.user_name || prev.userName,
-            initRole: profile.init_role_sp || prev.initRole,
-            userInfo: profile.user_info || prev.userInfo,
-            goldenSp: profile.golden_sp || prev.goldenSp,
-            notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
-          }))
-          const ignore = new Set([
-            'role',
-            'mode',
-            'role_name',
-            'user_name',
-            'init_role_sp',
-            'user_info',
-            'golden_sp',
-            'notes',
-            'chat_id',
-          ])
-          setNpcExtras(toKVExtras(profile, ignore))
-        }
-        if (actors?.user?.profile) {
-          const profile = actors.user.profile
-          setUserActorId(actors.user.id || '')
-          setUserForm((prev) => ({
-            ...prev,
-            displayName: profile.display_name || prev.displayName,
-            background: profile.background || prev.background,
-            persona: profile.persona || prev.persona,
-            goals: profile.goals || prev.goals,
-            constraints: profile.constraints || prev.constraints,
-            notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
-          }))
-          const ignore = new Set([
-            'role',
-            'display_name',
-            'background',
-            'persona',
-            'goals',
-            'constraints',
-            'notes',
-            'chat_id',
-          ])
-          setUserExtras(toKVExtras(profile, ignore))
-        }
-      } catch (err) {
-        // Ignore actor auto-fill failures to avoid blocking chat load
-      }
-      await loadMemoryConfig(id)
-      await loadUserMemoryConfig(id)
-      await loadSessionConfig(id)
-      await refreshStats(id)
-      await loadMemoryStates(id)
+      const data = await api<any>(`/chats/${targetId}`)
+      if (reqId !== chatLoadReqRef.current) return
+      setChatId(targetId)
+      setDownloadId(targetId)
+      setMessages(sortMessagesChronologically(data.messages || []))
+
+      const sideTasks: Promise<any>[] = [refreshChatSideData(targetId)]
+      if (data.world_id) sideTasks.push(loadWorldById(data.world_id, true))
+      sideTasks.push(
+        api<any>(`/chats/${targetId}/actors`)
+          .then((actors) => {
+            if (actors?.npc?.profile) applyNpcProfile(actors.npc.profile, actors.npc.id || '')
+            if (actors?.user?.profile) applyUserProfile(actors.user.profile, actors.user.id || '')
+          })
+          .catch(() => {
+            // ignore actor auto-fill failures to avoid blocking chat load
+          })
+      )
+
+      await Promise.allSettled(sideTasks)
+      if (reqId !== chatLoadReqRef.current) return
       setStatus('对话已加载')
     } catch (err: any) {
+      if (reqId !== chatLoadReqRef.current) return
       setError(err.message)
       setStatus('')
     } finally {
-      setBusy(false)
+      if (reqId === chatLoadReqRef.current) setBusy(false)
     }
   }
 
@@ -1102,27 +1147,7 @@ export default function App() {
       })
       const profile = data.profile || {}
       setNpcActorId('')
-      setNpcForm((prev) => ({
-        ...prev,
-        mode: profile.mode || prev.mode,
-        roleName: profile.role_name || prev.roleName,
-        userName: profile.user_name || prev.userName,
-        initRole: profile.init_role_sp || prev.initRole,
-        userInfo: profile.user_info || prev.userInfo,
-        goldenSp: profile.golden_sp || prev.goldenSp,
-        notes: Array.isArray(profile.notes) ? profile.notes.map(String) : prev.notes,
-      }))
-      const ignore = new Set([
-        'role',
-        'mode',
-        'role_name',
-        'user_name',
-        'init_role_sp',
-        'user_info',
-        'golden_sp',
-        'notes',
-      ])
-      setNpcExtras(toKVExtras(profile, ignore))
+      applyNpcProfile(profile)
       setStatus('NPC 设定已生成')
     } catch (err: any) {
       setStatus('世界已生成')
@@ -1149,7 +1174,10 @@ export default function App() {
       setMessages([])
       setStats(null)
       setMemoryConfig(null)
+      setUserMemoryConfig(null)
       setSessionConfig(null)
+      setNpcMemory(null)
+      setUserMemory(null)
       setDownloadId('')
       setStatus('世界已生成')
       setNotice({
@@ -1215,33 +1243,24 @@ export default function App() {
       setError('请先创建或加载对话')
       return
     }
-    if (!inputText.trim()) {
+    const text = inputText.trim()
+    if (!text) {
       setError('请输入要发送的消息')
       return
     }
-    const text = inputText
     setInputText('')
+    let tempUserId = ''
+    let npcTempId = ''
     try {
       setBusy(true)
       setStatus('发送中...')
-      const tempId = `temp-${Date.now()}`
-      const tempTurn = (() => {
-        if (!messages.length) return 1
-        const sorted = [...messages].sort((a, b) => {
-          const ta = a.created_at ? new Date(a.created_at).getTime() : 0
-          const tb = b.created_at ? new Date(b.created_at).getTime() : 0
-          if (ta && tb && ta !== tb) return ta - tb
-          return a.turn_index - b.turn_index
-        })
-        const last = sorted[sorted.length - 1]
-        if (last.role !== 'user') return last.turn_index
-        return last.turn_index + 1
-      })()
-      const npcTempId = `temp-npc-${Date.now()}`
+      tempUserId = stableTempId('temp-user')
+      npcTempId = stableTempId('temp-npc')
+      const tempTurn = nextTurnForRole(messages, 'user')
       setMessages((prev) => [
         ...prev,
         {
-          id: tempId,
+          id: tempUserId,
           role: 'user',
           content: text,
           turn_index: tempTurn,
@@ -1262,6 +1281,9 @@ export default function App() {
           )
         )
       }
+      const finalizeUser = (msg: Message) => {
+        setMessages((prev) => prev.map((m) => (m.id === tempUserId ? { ...m, ...msg } : m)))
+      }
       const finalizeNpc = (msg: Message) => {
         setNpcStreamingId('')
         setMessages((prev) =>
@@ -1275,14 +1297,15 @@ export default function App() {
         desire_score: inputDesire,
       }, {
         onDelta: appendNpc,
+        onUserDone: finalizeUser,
         onNpcDone: finalizeNpc,
       })
-      await loadChatById(chatId)
+      await Promise.allSettled([refreshStats(chatId), loadMemoryStates(chatId)])
       setStatus('已发送')
     } catch (err: any) {
       setError(err.message)
       setInputText(text)
-      setMessages((prev) => prev.filter((m) => !m.id.startsWith('temp-')))
+      setMessages((prev) => prev.filter((m) => m.id !== tempUserId && m.id !== npcTempId))
       setNpcStreamingId('')
       setStatus('')
     } finally {
@@ -1300,7 +1323,7 @@ export default function App() {
       setBusy(true)
       setStatus(`自动对话（${steps}轮）...`)
       await streamAuto(`/chats/${chatId}/auto/step/stream`, { max_steps: steps, desire_stop: 4 })
-      await loadChatById(chatId)
+      await Promise.allSettled([refreshStats(chatId), loadMemoryStates(chatId)])
       setStatus('完成')
     } catch (err: any) {
       setError(err.message)
@@ -1322,7 +1345,7 @@ export default function App() {
         max_steps: 30,
         desire_stop: 4,
       })
-      await loadChatById(chatId)
+      await Promise.allSettled([refreshStats(chatId), loadMemoryStates(chatId)])
       setStatus('完成')
     } catch (err: any) {
       setError(err.message)
@@ -1333,14 +1356,14 @@ export default function App() {
   }
 
   const streamAuto = async (path: string, payload: Record<string, any>) => {
-    let npcTempId = `temp-npc-${Date.now()}`
+    let npcTempId = stableTempId('temp-npc')
     setMessages((prev) => [
       ...prev,
       {
         id: npcTempId,
         role: 'npc',
         content: '',
-        turn_index: prev.length ? prev[prev.length - 1].turn_index : 1,
+        turn_index: nextTurnForRole(prev, 'npc'),
         created_at: new Date().toISOString(),
       },
     ])
@@ -1360,19 +1383,20 @@ export default function App() {
         )
       },
       onUserDone: (msg) => {
-        setMessages((prev) => [...prev, msg])
-        npcTempId = `temp-npc-${Date.now()}`
+        const nextTempId = stableTempId('temp-npc')
+        npcTempId = nextTempId
         setMessages((prev) => [
           ...prev,
+          msg,
           {
-            id: npcTempId,
+            id: nextTempId,
             role: 'npc',
             content: '',
             turn_index: msg.turn_index,
             created_at: new Date().toISOString(),
           },
         ])
-        setNpcStreamingId(npcTempId)
+        setNpcStreamingId(nextTempId)
       },
     })
     setMessages((prev) => prev.filter((m) => !(m.id.startsWith('temp-npc') && !m.content)))
@@ -1457,6 +1481,9 @@ export default function App() {
     }
   }
 
+  const statusText = npcStreamingId ? 'NPC 正在输入...' : status || `API: ${API_BASE}`
+  const inputLength = inputText.length
+
   return (
     <div className="app">
       <div className="fx-layer" aria-hidden />
@@ -1484,7 +1511,9 @@ export default function App() {
                 </Button>
               ) : null}
             </span>
-            <span className="status-pill">{status || `API: ${API_BASE}`}</span>
+            <span className={`status-pill ${npcStreamingId ? 'live' : ''}`} aria-live="polite">
+              {statusText}
+            </span>
           </div>
           <div className="theme-switch">
             <span>风格</span>
@@ -1505,7 +1534,14 @@ export default function App() {
         </div>
       </header>
 
-      {error ? <div className="banner error">操作失败：{error}</div> : null}
+      {error ? (
+        <div className="banner error">
+          <div className="banner-main">操作失败：{error}</div>
+          <Button type="text" className="banner-close" onClick={() => setError('')}>
+            关闭
+          </Button>
+        </div>
+      ) : null}
 
       <div className="board">
         <div className="column left">
@@ -1831,7 +1867,9 @@ export default function App() {
                           {m.created_at ? <span className="time">{formatTime(m.created_at)}</span> : null}
                           {m.emotion_label ? <Tag className="pill">{m.emotion_label}</Tag> : null}
                           {m.topic_tag ? <Tag className="pill">{m.topic_tag}</Tag> : null}
-                          {m.desire_score ? <Tag className="pill">欲望 {m.desire_score}</Tag> : null}
+                          {m.desire_score !== null && m.desire_score !== undefined ? (
+                            <Tag className="pill">欲望 {m.desire_score}</Tag>
+                          ) : null}
                         </div>
                         <div className="message-text">
                           {m.content ? (
@@ -1863,6 +1901,9 @@ export default function App() {
                 <div className="panel-sub">用户消息 + 欲望评分</div>
               </div>
               <div className="panel-actions">
+                <Button className="ghost" onClick={() => setInputText('')} disabled={busy || !inputText.length}>
+                  清空
+                </Button>
                 <Button type="primary" onClick={sendMessage} disabled={busy || !chatId || !inputText.trim()}>
                   发送
                 </Button>
@@ -1870,36 +1911,45 @@ export default function App() {
             </div>
             <div className="panel-body">
               {composerHint ? <div className="hint">{composerHint}</div> : null}
+              <div className="composer-meta">
+                <span>Enter 发送，Shift + Enter 换行</span>
+                <span className="composer-counter">字数 {inputLength}</span>
+              </div>
               <div className="composer-grid">
-                <TextArea
-                  placeholder="输入用户消息..."
-                  value={inputText}
-                  onChange={(e) => setInputText(e.target.value)}
-                  disabled={busy}
-                  ref={composerRef}
-                  autoSize={{ minRows: 4, maxRows: 8 }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey) {
-                      e.preventDefault()
-                      if (!busy && chatId && inputText.trim()) {
-                        sendMessage()
+                <div className="composer-input-wrap">
+                  <TextArea
+                    placeholder="输入用户消息..."
+                    value={inputText}
+                    onChange={(e) => setInputText(e.target.value)}
+                    disabled={busy}
+                    ref={composerRef}
+                    autoSize={{ minRows: 4, maxRows: 8 }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey && !e.altKey && !e.ctrlKey) {
+                        e.preventDefault()
+                        if (!busy && chatId && inputText.trim()) {
+                          sendMessage()
+                        }
                       }
-                    }
-                  }}
-                />
-                <div className="composer-side">
-                  <label>继续意愿</label>
-                  <div className="range-row">
-                    <Slider
-                      min={1}
-                      max={10}
-                      value={inputDesire}
-                      onChange={(value) => setInputDesire(value as number)}
-                      disabled={busy}
-                    />
-                    <span className="range-value">{inputDesire}</span>
+                    }}
+                  />
+                </div>
+                <div className="composer-desire">
+                  <div className="desire-head">
+                    <span className="desire-title">继续意愿</span>
+                    <span className="desire-value">{inputDesire}</span>
                   </div>
-                  <p className="muted">1 表示很想停止，10 表示非常想继续。</p>
+                  <Slider
+                    min={1}
+                    max={10}
+                    value={inputDesire}
+                    onChange={(value) => setInputDesire(value as number)}
+                    disabled={busy}
+                  />
+                  <div className="desire-scale">
+                    <span>1 结束倾向</span>
+                    <span>10 继续倾向</span>
+                  </div>
                 </div>
               </div>
             </div>

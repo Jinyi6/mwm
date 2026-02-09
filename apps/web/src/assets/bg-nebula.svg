@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <radialGradient id="space" cx="50%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#2f3f88"/>
+      <stop offset="45%" stop-color="#182455"/>
+      <stop offset="100%" stop-color="#070c1f"/>
+    </radialGradient>
+    <radialGradient id="cloudA" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#7ea2ff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#7ea2ff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="cloudB" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffb36a" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#ffb36a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#space)"/>
+  <ellipse cx="520" cy="280" rx="420" ry="240" fill="url(#cloudA)"/>
+  <ellipse cx="1480" cy="360" rx="470" ry="260" fill="url(#cloudB)"/>
+  <ellipse cx="980" cy="640" rx="620" ry="290" fill="url(#cloudA)" opacity="0.45"/>
+  <g fill="#dbe6ff" opacity="0.7">
+    <circle cx="120" cy="90" r="2"/>
+    <circle cx="230" cy="160" r="1.8"/>
+    <circle cx="360" cy="120" r="1.4"/>
+    <circle cx="520" cy="180" r="1.9"/>
+    <circle cx="690" cy="100" r="1.6"/>
+    <circle cx="840" cy="170" r="1.4"/>
+    <circle cx="1010" cy="130" r="1.9"/>
+    <circle cx="1180" cy="180" r="1.5"/>
+    <circle cx="1330" cy="110" r="2"/>
+    <circle cx="1480" cy="160" r="1.5"/>
+    <circle cx="1660" cy="120" r="1.8"/>
+    <circle cx="1810" cy="180" r="1.6"/>
+    <circle cx="1740" cy="300" r="1.4"/>
+    <circle cx="1560" cy="260" r="1.5"/>
+    <circle cx="1280" cy="290" r="1.4"/>
+    <circle cx="960" cy="260" r="1.6"/>
+    <circle cx="620" cy="300" r="1.5"/>
+    <circle cx="300" cy="270" r="1.4"/>
+  </g>
+</svg>

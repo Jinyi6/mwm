@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" preserveAspectRatio="xMidYMid slice">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#081021"/>
+      <stop offset="55%" stop-color="#0f1c33"/>
+      <stop offset="100%" stop-color="#1f1a22"/>
+    </linearGradient>
+    <radialGradient id="moon" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f6e8c9" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#f6e8c9" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="fog" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#b8d3ff" stop-opacity="0"/>
+      <stop offset="50%" stop-color="#b8d3ff" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#b8d3ff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#night)"/>
+  <circle cx="1440" cy="190" r="140" fill="url(#moon)"/>
+  <g fill="#090f1d" opacity="0.82">
+    <path d="M0 820 L180 640 L290 780 L460 600 L620 820 Z"/>
+    <path d="M520 820 L700 560 L820 760 L940 520 L1120 820 Z"/>
+    <path d="M1030 820 L1220 590 L1360 760 L1520 530 L1710 820 Z"/>
+    <path d="M1500 820 L1670 640 L1780 760 L1920 620 L1920 1080 L1500 1080 Z"/>
+    <rect x="0" y="820" width="1920" height="260"/>
+  </g>
+  <g opacity="0.35">
+    <rect x="120" y="760" width="1680" height="46" fill="url(#fog)"/>
+    <rect x="80" y="840" width="1760" height="60" fill="url(#fog)"/>
+    <rect x="40" y="930" width="1840" height="72" fill="url(#fog)"/>
+  </g>
+  <g fill="#ffdba1" opacity="0.16">
+    <rect x="260" y="735" width="8" height="16"/>
+    <rect x="742" y="688" width="8" height="16"/>
+    <rect x="1194" y="706" width="8" height="16"/>
+    <rect x="1626" y="670" width="8" height="16"/>
+  </g>
+</svg>

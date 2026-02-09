@@ -1,0 +1,55 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1920 1080' preserveAspectRatio='xMidYMid slice'>
+  <defs>
+    <linearGradient id='sky' x1='0' y1='0' x2='0' y2='1'>
+      <stop offset='0%' stop-color='#1f2c47'/>
+      <stop offset='55%' stop-color='#19253b'/>
+      <stop offset='100%' stop-color='#0f1729'/>
+    </linearGradient>
+    <linearGradient id='street' x1='0' y1='0' x2='1' y2='1'>
+      <stop offset='0%' stop-color='#1f2737'/>
+      <stop offset='100%' stop-color='#121927'/>
+    </linearGradient>
+    <radialGradient id='lamp' cx='50%' cy='50%' r='50%'>
+      <stop offset='0%' stop-color='#ffd8a1' stop-opacity='0.85'/>
+      <stop offset='100%' stop-color='#ffd8a1' stop-opacity='0'/>
+    </radialGradient>
+    <linearGradient id='fog' x1='0' y1='0' x2='1' y2='0'>
+      <stop offset='0%' stop-color='#9bb5d8' stop-opacity='0'/>
+      <stop offset='45%' stop-color='#9bb5d8' stop-opacity='0.15'/>
+      <stop offset='100%' stop-color='#9bb5d8' stop-opacity='0'/>
+    </linearGradient>
+  </defs>
+  <rect width='1920' height='1080' fill='url(#sky)'/>
+  <rect y='700' width='1920' height='380' fill='url(#street)'/>
+
+  <g fill='#0e1626' opacity='0.92'>
+    <rect x='60' y='330' width='180' height='380'/>
+    <rect x='252' y='290' width='210' height='420'/>
+    <rect x='476' y='350' width='150' height='360'/>
+    <rect x='652' y='270' width='250' height='440'/>
+    <rect x='942' y='315' width='220' height='395'/>
+    <rect x='1190' y='288' width='260' height='422'/>
+    <rect x='1486' y='338' width='170' height='372'/>
+    <rect x='1672' y='280' width='180' height='430'/>
+  </g>
+
+  <g opacity='0.72'>
+    <circle cx='350' cy='520' r='66' fill='url(#lamp)'/>
+    <circle cx='790' cy='490' r='74' fill='url(#lamp)'/>
+    <circle cx='1290' cy='520' r='70' fill='url(#lamp)'/>
+    <circle cx='1730' cy='500' r='62' fill='url(#lamp)'/>
+  </g>
+
+  <g opacity='0.2'>
+    <rect x='80' y='760' width='1760' height='36' fill='url(#fog)'/>
+    <rect x='50' y='820' width='1820' height='52' fill='url(#fog)'/>
+    <rect x='20' y='900' width='1880' height='70' fill='url(#fog)'/>
+  </g>
+
+  <g stroke='#8aa4c9' stroke-opacity='0.15' stroke-width='2'>
+    <path d='M0 780 H1920'/>
+    <path d='M0 845 H1920'/>
+    <path d='M0 918 H1920'/>
+    <path d='M0 995 H1920'/>
+  </g>
+</svg>

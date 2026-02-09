@@ -1,0 +1,53 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1920 1080' preserveAspectRatio='xMidYMid slice'>
+  <defs>
+    <linearGradient id='night' x1='0' y1='0' x2='1' y2='1'>
+      <stop offset='0%' stop-color='#21183c'/>
+      <stop offset='45%' stop-color='#1a1433'/>
+      <stop offset='100%' stop-color='#120f25'/>
+    </linearGradient>
+    <radialGradient id='nebA' cx='50%' cy='50%' r='50%'>
+      <stop offset='0%' stop-color='#b9a7ff' stop-opacity='0.38'/>
+      <stop offset='100%' stop-color='#b9a7ff' stop-opacity='0'/>
+    </radialGradient>
+    <radialGradient id='nebB' cx='50%' cy='50%' r='50%'>
+      <stop offset='0%' stop-color='#ffb7e2' stop-opacity='0.35'/>
+      <stop offset='100%' stop-color='#ffb7e2' stop-opacity='0'/>
+    </radialGradient>
+    <linearGradient id='mist' x1='0' y1='0' x2='1' y2='0'>
+      <stop offset='0%' stop-color='#d8d1ff' stop-opacity='0'/>
+      <stop offset='40%' stop-color='#d8d1ff' stop-opacity='0.18'/>
+      <stop offset='100%' stop-color='#d8d1ff' stop-opacity='0'/>
+    </linearGradient>
+  </defs>
+  <rect width='1920' height='1080' fill='url(#night)'/>
+  <ellipse cx='520' cy='290' rx='420' ry='220' fill='url(#nebA)'/>
+  <ellipse cx='1430' cy='360' rx='500' ry='260' fill='url(#nebB)'/>
+  <ellipse cx='980' cy='690' rx='700' ry='320' fill='url(#nebA)' opacity='0.5'/>
+
+  <g fill='#0f1120' opacity='0.86'>
+    <path d='M0 820 L170 670 L290 760 L410 620 L570 820 Z'/>
+    <path d='M500 820 L700 560 L830 730 L980 500 L1170 820 Z'/>
+    <path d='M1030 820 L1210 620 L1350 760 L1490 560 L1700 820 Z'/>
+    <path d='M1600 820 L1760 680 L1920 760 L1920 1080 L1600 1080 Z'/>
+    <rect x='0' y='820' width='1920' height='260'/>
+  </g>
+
+  <g fill='#efe8ff' opacity='0.65'>
+    <circle cx='120' cy='120' r='2'/>
+    <circle cx='240' cy='190' r='1.6'/>
+    <circle cx='350' cy='150' r='1.8'/>
+    <circle cx='520' cy='210' r='1.4'/>
+    <circle cx='710' cy='160' r='2'/>
+    <circle cx='920' cy='230' r='1.6'/>
+    <circle cx='1110' cy='150' r='1.8'/>
+    <circle cx='1300' cy='220' r='1.5'/>
+    <circle cx='1510' cy='170' r='2'/>
+    <circle cx='1710' cy='230' r='1.6'/>
+  </g>
+
+  <g opacity='0.22'>
+    <rect x='100' y='760' width='1700' height='40' fill='url(#mist)'/>
+    <rect x='60' y='830' width='1780' height='54' fill='url(#mist)'/>
+    <rect x='20' y='910' width='1860' height='70' fill='url(#mist)'/>
+  </g>
+</svg>
